@@ -202,6 +202,7 @@ fn run_check(args: CheckArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
 
     let config = loaded_config.unwrap_or_else(Config::default_config);
 
@@ -283,10 +284,14 @@ fn run_check(args: CheckArgs) -> ExitCode {
             let effective_schema = if let Some(ref s) = schema_override_source {
                 Some(s.clone())
             } else {
-                let relative = Path::new(path)
-                    .strip_prefix(&project_root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| path.clone());
+                let relative = std::fs::canonicalize(Path::new(path))
+                    .ok()
+                    .and_then(|abs| {
+                        abs.strip_prefix(&project_root)
+                            .ok()
+                            .map(|p| p.to_string_lossy().to_string())
+                    })
+                    .unwrap_or_else(|| path.clone());
 
                 compiled_mappings.resolve(&relative, &project_root)
             };
