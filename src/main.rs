@@ -362,7 +362,12 @@ fn load_config(
     if let Some(path) = config_path {
         // Explicit --config: failure is a hard error
         let cfg = Config::load(path)?;
-        let root = path.parent().unwrap_or(cwd).to_path_buf();
+        let abs_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let root = abs_path.parent().unwrap_or(cwd).to_path_buf();
         Ok((Some(cfg), root))
     } else {
         // Auto-discover: failure is non-fatal (use defaults)
