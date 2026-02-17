@@ -252,3 +252,99 @@ fn schema_mapping_works_with_parent_traversal_path() {
         "File should not be skipped\njson: {json:#}"
     );
 }
+
+/// Regression: --config jvl.json (bare filename) with explicit file arg.
+/// path.parent() on "jvl.json" returns Some(""), making project_root empty.
+/// This broke schema mapping because canonicalize("") fails.
+#[test]
+fn schema_mapping_works_with_bare_config_path_and_explicit_file() {
+    let dir = setup_project();
+
+    let output = jvl()
+        .args([
+            "check",
+            "--format",
+            "json",
+            "--config",
+            "jvl.json",
+            "src/invalid.json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run jvl");
+
+    let json = parse_json_output(&output);
+
+    assert_eq!(
+        json["summary"]["checked_files"].as_u64(),
+        Some(1),
+        "File should be checked with schema mapping applied\njson: {json:#}"
+    );
+    assert_eq!(
+        json["summary"]["skipped_files"].as_u64(),
+        Some(0),
+        "File should not be skipped\njson: {json:#}"
+    );
+    assert_eq!(
+        json["summary"]["invalid_files"].as_u64(),
+        Some(1),
+        "File should fail schema validation\njson: {json:#}"
+    );
+}
+
+/// Same regression with dotslash config path.
+#[test]
+fn schema_mapping_works_with_dotslash_config_path_and_explicit_file() {
+    let dir = setup_project();
+
+    let output = jvl()
+        .args([
+            "check",
+            "--format",
+            "json",
+            "--config",
+            "./jvl.json",
+            "src/invalid.json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run jvl");
+
+    let json = parse_json_output(&output);
+
+    assert_eq!(
+        json["summary"]["checked_files"].as_u64(),
+        Some(1),
+        "File should be checked with schema mapping applied\njson: {json:#}"
+    );
+    assert_eq!(
+        json["summary"]["skipped_files"].as_u64(),
+        Some(0),
+        "File should not be skipped\njson: {json:#}"
+    );
+}
+
+/// --config with bare filename and auto-discovery (no explicit files).
+#[test]
+fn schema_mapping_works_with_bare_config_path_and_discovery() {
+    let dir = setup_project();
+
+    let output = jvl()
+        .args(["check", "--format", "json", "--config", "jvl.json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to run jvl");
+
+    let json = parse_json_output(&output);
+
+    assert_eq!(
+        json["summary"]["checked_files"].as_u64(),
+        Some(2),
+        "Both src/ files should be checked via schema mapping\njson: {json:#}"
+    );
+    assert_eq!(
+        json["summary"]["invalid_files"].as_u64(),
+        Some(1),
+        "invalid.json should fail validation\njson: {json:#}"
+    );
+}
