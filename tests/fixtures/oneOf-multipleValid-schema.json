@@ -1,0 +1,7 @@
+{
+  "type": "object",
+  "properties": {
+    "value": { "oneOf": [{ "type": "number" }, { "minimum": 0 }] }
+  },
+  "required": ["value"]
+}

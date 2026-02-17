@@ -1,0 +1,7 @@
+{
+  "type": "object",
+  "properties": {
+    "items": { "type": "array", "contains": { "type": "number" } }
+  },
+  "required": ["items"]
+}

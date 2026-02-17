@@ -1,0 +1,5 @@
+{
+  "type": "object",
+  "properties": { "tags": { "type": "array", "maxItems": 2 } },
+  "required": ["tags"]
+}

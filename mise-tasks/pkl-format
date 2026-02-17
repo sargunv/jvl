@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#MISE description="Format pkl via stdin/stdout"
+#MISE hide=true
+mise x -- pkl format -
+ret=$?
+if [ $ret -eq 11 ]; then
+  exit 0
+else
+  exit $ret
+fi

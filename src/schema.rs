@@ -1,0 +1,321 @@
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use thiserror::Error;
+
+use crate::diagnostic::Warning;
+
+#[derive(Debug, Clone, Error)]
+pub enum SchemaError {
+    #[error("Failed to read schema file '{path}': {reason}")]
+    FileRead { path: String, reason: String },
+    #[error("Failed to parse schema from '{path}': {reason}")]
+    ParseError { path: String, reason: String },
+    #[error("Failed to fetch schema from '{url}': {reason}")]
+    FetchError { url: String, reason: String },
+    #[error("Failed to compile schema: {0}")]
+    CompileError(String),
+}
+
+/// Where the schema came from.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum SchemaSource {
+    /// A local file path (absolute).
+    File(PathBuf),
+    /// An HTTP/HTTPS URL.
+    Url(String),
+}
+
+impl std::fmt::Display for SchemaSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaSource::File(p) => write!(f, "{}", p.display()),
+            SchemaSource::Url(u) => write!(f, "{u}"),
+        }
+    }
+}
+
+/// Resolve a `$schema` string to a SchemaSource.
+///
+/// - URLs (http:// or https://) become `SchemaSource::Url`.
+/// - Absolute paths become `SchemaSource::File`.
+/// - Relative paths are resolved relative to `base_dir`.
+pub fn resolve_schema_ref(schema_ref: &str, base_dir: &Path) -> SchemaSource {
+    if schema_ref.starts_with("http://") || schema_ref.starts_with("https://") {
+        SchemaSource::Url(schema_ref.to_string())
+    } else {
+        let path = Path::new(schema_ref);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base_dir.join(path)
+        };
+        SchemaSource::File(abs)
+    }
+}
+
+/// Cache directory for fetched schemas.
+fn cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("jvl").join("schemas"))
+}
+
+/// SHA-256 hex digest of a URL, used as cache key.
+fn url_hash(url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Metadata for a cached schema.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CacheMeta {
+    url: String,
+    fetched_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
+}
+
+/// TTL for cached schemas: 24 hours.
+const CACHE_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// HTTP request timeout.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Load schema content from a source, using disk cache for URLs.
+///
+/// Returns `(schema_json_string, warnings)`.
+pub fn load_schema_content(
+    source: &SchemaSource,
+    no_cache: bool,
+) -> Result<(String, Vec<Warning>), SchemaError> {
+    match source {
+        SchemaSource::File(path) => {
+            let content = fs::read_to_string(path).map_err(|e| SchemaError::FileRead {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+            Ok((content, vec![]))
+        }
+        SchemaSource::Url(url) => load_url_schema(url, no_cache),
+    }
+}
+
+fn load_url_schema(url: &str, no_cache: bool) -> Result<(String, Vec<Warning>), SchemaError> {
+    let hash = url_hash(url);
+
+    if no_cache {
+        let content = fetch_url(url)?;
+        return Ok((content, vec![]));
+    }
+
+    let cache_base = cache_dir();
+
+    // Try to read from cache
+    if let Some(ref base) = cache_base {
+        let schema_path = base.join(format!("{hash}.json"));
+        let meta_path = base.join(format!("{hash}.meta"));
+
+        if schema_path.exists() {
+            let cached_content = fs::read_to_string(&schema_path).ok();
+
+            if let Some(content) = cached_content {
+                if is_within_ttl(&meta_path) {
+                    return Ok((content, vec![]));
+                }
+
+                // Stale: attempt re-fetch. Use fresh content if successful,
+                // fall back to stale content on failure.
+                match fetch_url(url) {
+                    Ok(fresh) => {
+                        let _ = write_cache(base, &hash, url, &fresh);
+                        return Ok((fresh, vec![]));
+                    }
+                    Err(_) => {
+                        let warning = Warning {
+                            code: "cache(stale)".into(),
+                            message: format!(
+                                "Using stale cached schema for {url} (re-fetch failed)"
+                            ),
+                        };
+                        return Ok((content, vec![warning]));
+                    }
+                }
+            }
+        }
+    }
+
+    // No cache hit — fetch synchronously
+    let content = fetch_url(url)?;
+
+    // Write to cache
+    if let Some(ref base) = cache_base {
+        let _ = write_cache(base, &hash, url, &content);
+    }
+
+    Ok((content, vec![]))
+}
+
+fn is_within_ttl(meta_path: &Path) -> bool {
+    let meta_str = fs::read_to_string(meta_path).ok();
+    let meta = meta_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<CacheMeta>(s).ok());
+    let fetched_at = meta
+        .as_ref()
+        .and_then(|m| m.fetched_at.parse::<jiff::Timestamp>().ok());
+    match fetched_at {
+        Some(ts) => ts.duration_until(jiff::Timestamp::now()).as_secs() < CACHE_TTL_SECS,
+        None => false,
+    }
+}
+
+fn fetch_url(url: &str) -> Result<String, SchemaError> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| SchemaError::FetchError {
+            url: url.to_string(),
+            reason: e.to_string(),
+        })?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| SchemaError::FetchError {
+            url: url.to_string(),
+            reason: e.to_string(),
+        })?;
+    if !resp.status().is_success() {
+        return Err(SchemaError::FetchError {
+            url: url.to_string(),
+            reason: format!("HTTP {}", resp.status()),
+        });
+    }
+    resp.text().map_err(|e| SchemaError::FetchError {
+        url: url.to_string(),
+        reason: e.to_string(),
+    })
+}
+
+fn write_cache(base: &Path, hash: &str, url: &str, content: &str) -> Result<(), std::io::Error> {
+    fs::create_dir_all(base)?;
+    let schema_path = base.join(format!("{hash}.json"));
+    let meta_path = base.join(format!("{hash}.meta"));
+    fs::write(&schema_path, content)?;
+    let meta = CacheMeta {
+        url: url.to_string(),
+        fetched_at: jiff::Timestamp::now().to_string(),
+        etag: None,
+    };
+    let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+    fs::write(&meta_path, meta_json)?;
+    Ok(())
+}
+
+/// Thread-safe cache of compiled schema validators.
+///
+/// Uses per-slot `OnceLock` to ensure each schema is fetched and compiled
+/// exactly once, even under concurrent access from multiple rayon threads.
+#[derive(Default)]
+pub struct SchemaCache {
+    slots: Mutex<HashMap<SchemaSource, Arc<SchemaSlot>>>,
+}
+
+struct SchemaSlot {
+    compiled: OnceLock<SlotResult>,
+    /// Ensures only the initializing thread reports warnings.
+    warnings_taken: AtomicBool,
+}
+
+struct SlotResult {
+    validator: Result<Arc<jsonschema::Validator>, SchemaError>,
+    warnings: Vec<Warning>,
+}
+
+impl SchemaCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get or load+compile a schema validator.
+    ///
+    /// Returns `(validator, warnings)`. The validator is wrapped in `Arc` for
+    /// cheap cloning across threads. Warnings are only returned to the first
+    /// caller (the one that triggered compilation).
+    pub fn get_or_compile(
+        &self,
+        source: &SchemaSource,
+        no_cache: bool,
+    ) -> Result<(Arc<jsonschema::Validator>, Vec<Warning>), SchemaError> {
+        let slot = {
+            let mut slots = self.slots.lock().unwrap();
+            slots
+                .entry(source.clone())
+                .or_insert_with(|| {
+                    Arc::new(SchemaSlot {
+                        compiled: OnceLock::new(),
+                        warnings_taken: AtomicBool::new(false),
+                    })
+                })
+                .clone()
+        };
+
+        // OnceLock::get_or_init guarantees exactly one thread runs the closure.
+        // Other threads calling concurrently will block until init completes.
+        let result = slot.compiled.get_or_init(|| {
+            let (content, warnings) = match load_schema_content(source, no_cache) {
+                Ok(r) => r,
+                Err(e) => {
+                    return SlotResult {
+                        validator: Err(e),
+                        warnings: vec![],
+                    };
+                }
+            };
+
+            let schema_value: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    return SlotResult {
+                        validator: Err(SchemaError::ParseError {
+                            path: source.to_string(),
+                            reason: e.to_string(),
+                        }),
+                        warnings,
+                    };
+                }
+            };
+
+            let validator = match jsonschema::validator_for(&schema_value) {
+                Ok(v) => v,
+                Err(e) => {
+                    return SlotResult {
+                        validator: Err(SchemaError::CompileError(e.to_string())),
+                        warnings,
+                    };
+                }
+            };
+
+            SlotResult {
+                validator: Ok(Arc::new(validator)),
+                warnings,
+            }
+        });
+
+        // Only the first caller to reach here takes the warnings.
+        let warnings = if !slot.warnings_taken.swap(true, Ordering::Relaxed) {
+            result.warnings.clone()
+        } else {
+            vec![]
+        };
+
+        match &result.validator {
+            Ok(v) => Ok((Arc::clone(v), warnings)),
+            Err(e) => Err(e.clone()),
+        }
+    }
+}

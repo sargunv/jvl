@@ -1,0 +1,16 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(not): {"type":"string"} is not allowed for "hello"
+   ╭─[[fixtures]/not-invalid.json:1:12]
+ 1 │ { "value": "hello" }
+   ·            ───┬───
+   ·               ╰── value is disallowed
+   ╰────
+  help: The value is explicitly disallowed by a 'not' constraint in the
+        schema.
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

@@ -1,0 +1,5 @@
+{
+  "type": "object",
+  "properties": { "version": { "const": 2 } },
+  "required": ["version"]
+}

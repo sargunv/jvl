@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(multipleOf): 7 is not a multiple of 5
+   ╭─[[fixtures]/multipleOf-invalid.json:1:12]
+ 1 │ { "value": 7 }
+   ·            ┬
+   ·            ╰── value is not a valid multiple
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

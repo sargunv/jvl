@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(maxItems): ["a","b","c"] has more than 2 items
+   ╭─[[fixtures]/maxItems-invalid.json:1:11]
+ 1 │ { "tags": ["a", "b", "c"] }
+   ·           ───────┬───────
+   ·                  ╰── array length out of range
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

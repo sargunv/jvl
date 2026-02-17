@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(pattern): "not-an-email" does not match "^[^@]+@[^@]+$"
+   ╭─[[fixtures]/pattern-invalid.json:1:12]
+ 1 │ { "email": "not-an-email" }
+   ·            ───────┬──────
+   ·                   ╰── value doesn't match pattern
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

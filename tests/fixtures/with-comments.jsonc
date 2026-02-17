@@ -1,0 +1,6 @@
+{
+  // Server configuration
+  "name": "my-app",
+  "port": 8080,
+  "enabled": true, // trailing comma
+}

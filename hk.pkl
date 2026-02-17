@@ -1,0 +1,35 @@
+amends "package://github.com/jdx/hk/releases/download/v1.32.0/hk@1.32.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.32.0/hk@1.32.0#/Builtins.pkl"
+
+local allSteps = new Mapping<String, Step> {
+  // formatters
+  ["dprint"] = Builtins.dprint
+  ["cargo_fmt"] = Builtins.cargo_fmt
+
+  // type checkers
+  ["cargo_check"] = (Builtins.cargo_check) {
+    check = "cargo check -Zwarnings --quiet"
+  }
+  ["pkl"] = Builtins.pkl
+
+  // linters
+  ["cargo_clippy"] = Builtins.cargo_clippy
+  ["jvl"] {
+    check = "cargo run -- check"
+  }
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = allSteps
+  }
+  ["fix"] {
+    fix = true
+    steps = allSteps
+  }
+  ["check"] {
+    steps = allSteps
+  }
+}

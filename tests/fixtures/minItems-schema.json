@@ -1,0 +1,5 @@
+{
+  "type": "object",
+  "properties": { "tags": { "type": "array", "minItems": 2 } },
+  "required": ["tags"]
+}

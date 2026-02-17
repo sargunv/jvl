@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(exclusiveMaximum): 10 is greater than or equal to the maximum of 10
+   ╭─[[fixtures]/exclusiveMaximum-invalid.json:1:12]
+ 1 │ { "value": 10 }
+   ·            ─┬
+   ·             ╰── value out of range
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

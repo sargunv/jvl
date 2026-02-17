@@ -1,0 +1,78 @@
+{
+  "$defs": {
+    "SchemaMapping": {
+      "anyOf": [
+        {
+          "allOf": [{ "$ref": "#/$defs/SchemaMappingUrl" }],
+          "description": "Fetch the schema from an HTTP/HTTPS URL."
+        },
+        {
+          "allOf": [{ "$ref": "#/$defs/SchemaMappingPath" }],
+          "description": "Load the schema from a local file path."
+        }
+      ],
+      "description": "A schema mapping entry. Exactly one of `url` or `path` must be present."
+    },
+    "SchemaMappingPath": {
+      "additionalProperties": false,
+      "description": "Schema mapping using a local file path.",
+      "properties": {
+        "files": {
+          "description": "Glob patterns matched against each file's path relative to the project root. At least one pattern is required.",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "type": "array"
+        },
+        "path": {
+          "description": "File path to the schema, resolved relative to the project root (directory containing jvl.json).",
+          "type": "string"
+        }
+      },
+      "required": ["files", "path"],
+      "type": "object"
+    },
+    "SchemaMappingUrl": {
+      "additionalProperties": false,
+      "description": "Schema mapping using an HTTP/HTTPS URL.",
+      "properties": {
+        "files": {
+          "description": "Glob patterns matched against each file's path relative to the project root. At least one pattern is required.",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "type": "array"
+        },
+        "url": {
+          "description": "HTTP/HTTPS URL to the schema (will be fetched and cached).",
+          "format": "uri",
+          "type": "string"
+        }
+      },
+      "required": ["files", "url"],
+      "type": "object"
+    }
+  },
+  "$id": "https://code.sargunv.dev/jvl/v1/jvl-config.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Configuration file for jvl, the JSON Schema Validator.",
+  "properties": {
+    "$schema": {
+      "description": "URL to the jvl config schema for self-validation.",
+      "type": "string"
+    },
+    "files": {
+      "default": ["**/*.json", "**/*.jsonc"],
+      "description": "Glob patterns for file discovery. Patterns prefixed with `!` are excludes. Order matters: later patterns override earlier ones.",
+      "items": { "type": "string" },
+      "type": "array"
+    },
+    "schemas": {
+      "default": [],
+      "description": "Schema mappings. Each entry associates a schema source (URL or local path) with a set of file glob patterns.",
+      "items": { "$ref": "#/$defs/SchemaMapping" },
+      "type": "array"
+    }
+  },
+  "title": "jvl configuration",
+  "type": "object"
+}

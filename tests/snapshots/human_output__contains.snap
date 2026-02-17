@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(contains): None of ["a","b","c"] are valid under the given schema
+   ╭─[[fixtures]/contains-invalid.json:1:12]
+ 1 │ { "items": ["a", "b", "c"] }
+   ·            ───────┬───────
+   ·                   ╰── no matching item found
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

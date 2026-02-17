@@ -1,0 +1,16 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(type): "not-a-number" is not of type "number"
+   ╭─[[fixtures]/with-bom-invalid.json:3:11]
+ 2 │   "name": "my-app",
+ 3 │   "port": "not-a-number"
+   ·           ───────┬──────
+   ·                  ╰── expected type "number"
+ 4 │ }
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

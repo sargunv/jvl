@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(type): "not-a-number" is not of type "number"
+   ╭─[[fixtures]/invalid-type.json:1:29]
+ 1 │ { "name": "my-app", "port": "not-a-number", "enabled": true }
+   ·                             ───────┬──────
+   ·                                    ╰── expected type "number"
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(enum): "yellow" is not one of "red", "green" or "blue"
+   ╭─[[fixtures]/enum-invalid.json:1:12]
+ 1 │ { "color": "yellow" }
+   ·            ────┬───
+   ·                ╰── value not in allowed set
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

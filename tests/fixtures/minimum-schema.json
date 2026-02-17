@@ -1,0 +1,5 @@
+{
+  "type": "object",
+  "properties": { "age": { "type": "number", "minimum": 0 } },
+  "required": ["age"]
+}

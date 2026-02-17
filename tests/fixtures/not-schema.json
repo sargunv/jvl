@@ -1,0 +1,5 @@
+{
+  "type": "object",
+  "properties": { "value": { "not": { "type": "string" } } },
+  "required": ["value"]
+}

@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(minProperties): {"a":1} has less than 2 properties
+   ╭─[[fixtures]/minProperties-invalid.json:1:1]
+ 1 │ { "a": 1 }
+   · ─────┬────
+   ·      ╰── property count out of range
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "level1": {
+      "type": "object",
+      "properties": {
+        "level2": {
+          "type": "object",
+          "properties": {
+            "level3": {
+              "type": "object",
+              "properties": { "value": { "type": "number" } },
+              "required": ["value"]
+            }
+          }
+        }
+      }
+    }
+  }
+}

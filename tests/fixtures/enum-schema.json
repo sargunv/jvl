@@ -1,0 +1,5 @@
+{
+  "type": "object",
+  "properties": { "color": { "enum": ["red", "green", "blue"] } },
+  "required": ["color"]
+}

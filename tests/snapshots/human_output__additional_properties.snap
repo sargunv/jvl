@@ -1,0 +1,16 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(additionalProperties): Additional properties are not allowed
+  │ ('extra' was unexpected)
+   ╭─[[fixtures]/additionalProperties-invalid.json:1:1]
+ 1 │ { "name": "test", "extra": true }
+   · ────────────────┬────────────────
+   ·                 ╰── unexpected property
+   ╰────
+  help: Remove the property, or check for typos in the property name.
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

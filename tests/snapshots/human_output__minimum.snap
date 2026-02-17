@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(minimum): -1 is less than the minimum of 0
+   ╭─[[fixtures]/minimum-invalid.json:1:10]
+ 1 │ { "age": -1 }
+   ·          ─┬
+   ·           ╰── value out of range
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

@@ -1,0 +1,1 @@
+{ "scripts": { "setup": "mise trust; mise install", "run": "mise test" } }

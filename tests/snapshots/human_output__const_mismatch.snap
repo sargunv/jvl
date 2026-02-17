@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(const): 2 was expected
+   ╭─[[fixtures]/const-invalid.json:1:14]
+ 1 │ { "version": 1 }
+   ·              ┬
+   ·              ╰── value doesn't match expected constant
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

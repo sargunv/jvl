@@ -1,0 +1,1 @@
+{ "$schema": "./simple-schema.json", "name": "my-app", "port": "wrong-type" }

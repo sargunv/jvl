@@ -1,0 +1,5 @@
+{
+  "type": "object",
+  "properties": { "score": { "type": "number", "maximum": 100 } },
+  "required": ["score"]
+}

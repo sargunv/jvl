@@ -1,0 +1,30 @@
+[settings]
+experimental = true
+pin = true
+
+[hooks]
+postinstall = ["hk install --mise"]
+
+[tools]
+rust = { version = "1.93.0", components = "clippy,rustfmt" }
+dprint = "0.51.1"
+hk = "1.36.0"
+java = "25.0.2"
+pkl = "0.30.2"
+
+[tasks.codegen]
+run = [
+  "cargo run -- config schema > config.schema.json && hk fix config.schema.json",
+]
+
+[tasks.test]
+run = ["cargo test"]
+
+[tasks.test-review]
+run = ["cargo insta review"]
+
+[tasks.check]
+run = ["hk check --all"]
+
+[tasks.fix]
+run = ["hk fix --all"]

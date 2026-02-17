@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(maximum): 101 is greater than the maximum of 100
+   ╭─[[fixtures]/maximum-invalid.json:1:12]
+ 1 │ { "score": 101 }
+   ·            ─┬─
+   ·             ╰── value out of range
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

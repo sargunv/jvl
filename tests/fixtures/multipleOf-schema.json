@@ -1,0 +1,5 @@
+{
+  "type": "object",
+  "properties": { "value": { "type": "number", "multipleOf": 5 } },
+  "required": ["value"]
+}

@@ -1,0 +1,23 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(required): "name" is a required property
+   ╭─[[fixtures]/missing-required.json:1:1]
+ 1 │ { "enabled": true }
+   · ─────────┬─────────
+   ·          ╰── required property missing here
+   ╰────
+  help: Add the missing property to this object.
+
+  × schema(required): "port" is a required property
+   ╭─[[fixtures]/missing-required.json:1:1]
+ 1 │ { "enabled": true }
+   · ─────────┬─────────
+   ·          ╰── required property missing here
+   ╰────
+  help: Add the missing property to this object.
+
+
+✗ Found 2 errors in 1 file
+  Checked 1 file ([duration])

@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(minLength): "ab" is shorter than 3 characters
+   ╭─[[fixtures]/minLength-invalid.json:1:11]
+ 1 │ { "name": "ab" }
+   ·           ──┬─
+   ·             ╰── string length out of range
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

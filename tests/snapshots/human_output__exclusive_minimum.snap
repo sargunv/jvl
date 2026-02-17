@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(exclusiveMinimum): 0 is less than or equal to the minimum of 0
+   ╭─[[fixtures]/exclusiveMinimum-invalid.json:1:12]
+ 1 │ { "value": 0 }
+   ·            ┬
+   ·            ╰── value out of range
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

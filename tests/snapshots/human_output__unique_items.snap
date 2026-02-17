@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(uniqueItems): [1,2,1] has non-unique elements
+   ╭─[[fixtures]/uniqueItems-invalid.json:1:10]
+ 1 │ { "ids": [1, 2, 1] }
+   ·          ────┬────
+   ·              ╰── array has duplicate items
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

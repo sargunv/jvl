@@ -1,0 +1,5 @@
+{
+  "type": "object",
+  "properties": { "ids": { "type": "array", "uniqueItems": true } },
+  "required": ["ids"]
+}

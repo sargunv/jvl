@@ -1,0 +1,16 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(oneOf): true is not valid under any of the schemas listed in the
+  │ 'oneOf' keyword
+   ╭─[[fixtures]/oneOf-notValid-invalid.json:1:12]
+ 1 │ { "value": true }
+   ·            ──┬─
+   ·              ╰── no matching schema
+   ╰────
+  help: The value must match exactly one of the listed schemas.
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])
