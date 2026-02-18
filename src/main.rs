@@ -223,7 +223,8 @@ fn run_check(args: CheckArgs) -> ExitCode {
 
     // Discover files
     let files_to_check = if args.files.is_empty() {
-        match discover::discover_files(&project_root, &config) {
+        // No explicit arguments: discover from cwd
+        match discover::discover_files(&project_root, std::slice::from_ref(&cwd), &config) {
             Ok((files, walk_warnings)) => {
                 early_warnings.extend(walk_warnings);
                 files
@@ -235,7 +236,38 @@ fn run_check(args: CheckArgs) -> ExitCode {
             }
         }
     } else {
-        args.files
+        // Partition explicit args into directories and files
+        let mut walk_roots: Vec<PathBuf> = Vec::new();
+        let mut explicit_files: Vec<PathBuf> = Vec::new();
+
+        for path in &args.files {
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            };
+            if resolved.is_dir() {
+                walk_roots.push(resolved);
+            } else {
+                explicit_files.push(path.clone());
+            }
+        }
+
+        if !walk_roots.is_empty() {
+            match discover::discover_files(&project_root, &walk_roots, &config) {
+                Ok((files, walk_warnings)) => {
+                    early_warnings.extend(walk_warnings);
+                    explicit_files.extend(files);
+                }
+                Err(e) => {
+                    let diag = ToolDiagnostic::error(format!("failed to discover files: {e}"));
+                    let _ = writeln!(stderr, "{:?}", miette::Report::new(diag));
+                    return ExitCode::from(2);
+                }
+            }
+        }
+
+        explicit_files
     };
 
     if files_to_check.is_empty() {
