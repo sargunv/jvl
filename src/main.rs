@@ -260,8 +260,7 @@ fn run_check(args: CheckArgs) -> ExitCode {
                     explicit_files.extend(files);
                 }
                 Err(e) => {
-                    let diag =
-                        ToolDiagnostic::error(format!("failed to discover files: {e}"));
+                    let diag = ToolDiagnostic::error(format!("failed to discover files: {e}"));
                     let _ = writeln!(stderr, "{:?}", miette::Report::new(diag));
                     return ExitCode::from(2);
                 }

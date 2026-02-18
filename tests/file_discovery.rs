@@ -67,7 +67,10 @@ fn discovery_from_subdirectory_scopes_to_cwd() {
 
     let total = json["summary"]["checked_files"].as_u64().unwrap()
         + json["summary"]["skipped_files"].as_u64().unwrap();
-    assert_eq!(total, 1, "Should only discover files under src/\njson: {json:#}");
+    assert_eq!(
+        total, 1,
+        "Should only discover files under src/\njson: {json:#}"
+    );
 }
 
 #[test]
@@ -91,7 +94,10 @@ fn directory_argument_expands_to_contained_files() {
 
     let total = json["summary"]["checked_files"].as_u64().unwrap()
         + json["summary"]["skipped_files"].as_u64().unwrap();
-    assert_eq!(total, 1, "Should only discover files under src/\njson: {json:#}");
+    assert_eq!(
+        total, 1,
+        "Should only discover files under src/\njson: {json:#}"
+    );
 }
 
 #[test]
