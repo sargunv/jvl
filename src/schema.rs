@@ -1,5 +1,4 @@
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,18 +12,25 @@ use crate::diagnostic::Warning;
 /// Describes how a URL schema was resolved from cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheOutcome {
-    /// Schema was served from a fresh cache entry.
+    /// Schema was served from a fresh disk-cache entry.
     Hit,
     /// Schema was not in cache and was fetched from the network.
     Miss,
-    /// Cache entry was stale; a re-fetch was attempted.
+    /// Disk-cache entry was stale; a re-fetch was attempted.
     Stale,
     /// Cache was explicitly bypassed via --no-cache.
     Bypassed,
 }
 
-thread_local! {
-    static LAST_CACHE_OUTCOME: Cell<Option<CacheOutcome>> = const { Cell::new(None) };
+impl CacheOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Stale => "stale",
+            Self::Bypassed => "bypassed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Error)]
@@ -105,32 +111,33 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Load schema content from a source, using disk cache for URLs.
 ///
-/// Returns `(schema_json_string, warnings)`.
-pub fn load_schema_content(
+/// Returns `(schema_json_string, warnings, cache_outcome)`.
+/// `cache_outcome` is `None` for file-based schemas (no caching involved).
+fn load_schema_content(
     source: &SchemaSource,
     no_cache: bool,
-) -> Result<(String, Vec<Warning>), SchemaError> {
-    // Reset the thread-local cache outcome before each load.
-    LAST_CACHE_OUTCOME.set(None);
+) -> Result<(String, Vec<Warning>, Option<CacheOutcome>), SchemaError> {
     match source {
         SchemaSource::File(path) => {
             let content = fs::read_to_string(path).map_err(|e| SchemaError::FileRead {
                 path: path.display().to_string(),
                 reason: e.to_string(),
             })?;
-            Ok((content, vec![]))
+            Ok((content, vec![], None))
         }
         SchemaSource::Url(url) => load_url_schema(url, no_cache),
     }
 }
 
-fn load_url_schema(url: &str, no_cache: bool) -> Result<(String, Vec<Warning>), SchemaError> {
+fn load_url_schema(
+    url: &str,
+    no_cache: bool,
+) -> Result<(String, Vec<Warning>, Option<CacheOutcome>), SchemaError> {
     let hash = url_hash(url);
 
     if no_cache {
-        LAST_CACHE_OUTCOME.set(Some(CacheOutcome::Bypassed));
         let content = fetch_url(url)?;
-        return Ok((content, vec![]));
+        return Ok((content, vec![], Some(CacheOutcome::Bypassed)));
     }
 
     let cache_base = cache_dir();
@@ -145,17 +152,15 @@ fn load_url_schema(url: &str, no_cache: bool) -> Result<(String, Vec<Warning>), 
 
             if let Some(content) = cached_content {
                 if is_within_ttl(&meta_path) {
-                    LAST_CACHE_OUTCOME.set(Some(CacheOutcome::Hit));
-                    return Ok((content, vec![]));
+                    return Ok((content, vec![], Some(CacheOutcome::Hit)));
                 }
 
                 // Stale: attempt re-fetch. Use fresh content if successful,
                 // fall back to stale content on failure.
-                LAST_CACHE_OUTCOME.set(Some(CacheOutcome::Stale));
                 match fetch_url(url) {
                     Ok(fresh) => {
                         let _ = write_cache(base, &hash, url, &fresh);
-                        return Ok((fresh, vec![]));
+                        return Ok((fresh, vec![], Some(CacheOutcome::Stale)));
                     }
                     Err(_) => {
                         let warning = Warning {
@@ -164,7 +169,7 @@ fn load_url_schema(url: &str, no_cache: bool) -> Result<(String, Vec<Warning>), 
                                 "Using stale cached schema for {url} (re-fetch failed)"
                             ),
                         };
-                        return Ok((content, vec![warning]));
+                        return Ok((content, vec![warning], Some(CacheOutcome::Stale)));
                     }
                 }
             }
@@ -172,7 +177,6 @@ fn load_url_schema(url: &str, no_cache: bool) -> Result<(String, Vec<Warning>), 
     }
 
     // No cache hit — fetch synchronously
-    LAST_CACHE_OUTCOME.set(Some(CacheOutcome::Miss));
     let content = fetch_url(url)?;
 
     // Write to cache
@@ -180,7 +184,7 @@ fn load_url_schema(url: &str, no_cache: bool) -> Result<(String, Vec<Warning>), 
         let _ = write_cache(base, &hash, url, &content);
     }
 
-    Ok((content, vec![]))
+    Ok((content, vec![], Some(CacheOutcome::Miss)))
 }
 
 fn is_within_ttl(meta_path: &Path) -> bool {
@@ -258,6 +262,7 @@ struct SchemaSlot {
 struct SlotResult {
     validator: Result<Arc<jsonschema::Validator>, SchemaError>,
     warnings: Vec<Warning>,
+    cache_outcome: Option<CacheOutcome>,
 }
 
 impl SchemaCache {
@@ -265,21 +270,25 @@ impl SchemaCache {
         Self::default()
     }
 
-    /// Read the last cache outcome for the calling thread (set during schema loading).
-    pub fn last_cache_outcome(&self) -> Option<CacheOutcome> {
-        LAST_CACHE_OUTCOME.get()
-    }
-
     /// Get or load+compile a schema validator.
     ///
-    /// Returns `(validator, warnings)`. The validator is wrapped in `Arc` for
-    /// cheap cloning across threads. Warnings are only returned to the first
-    /// caller (the one that triggered compilation).
+    /// Returns `(validator, warnings, cache_outcome)`. The validator is wrapped
+    /// in `Arc` for cheap cloning across threads. Warnings are only returned to
+    /// the first caller (the one that triggered compilation). `cache_outcome` is
+    /// `None` for file-based schemas or when the result was already compiled
+    /// in-memory by another thread.
     pub fn get_or_compile(
         &self,
         source: &SchemaSource,
         no_cache: bool,
-    ) -> Result<(Arc<jsonschema::Validator>, Vec<Warning>), SchemaError> {
+    ) -> Result<
+        (
+            Arc<jsonschema::Validator>,
+            Vec<Warning>,
+            Option<CacheOutcome>,
+        ),
+        SchemaError,
+    > {
         let slot = {
             let mut slots = self.slots.lock().unwrap();
             slots
@@ -296,12 +305,13 @@ impl SchemaCache {
         // OnceLock::get_or_init guarantees exactly one thread runs the closure.
         // Other threads calling concurrently will block until init completes.
         let result = slot.compiled.get_or_init(|| {
-            let (content, warnings) = match load_schema_content(source, no_cache) {
+            let (content, warnings, cache_outcome) = match load_schema_content(source, no_cache) {
                 Ok(r) => r,
                 Err(e) => {
                     return SlotResult {
                         validator: Err(e),
                         warnings: vec![],
+                        cache_outcome: None,
                     };
                 }
             };
@@ -315,6 +325,7 @@ impl SchemaCache {
                             reason: e.to_string(),
                         }),
                         warnings,
+                        cache_outcome,
                     };
                 }
             };
@@ -325,6 +336,7 @@ impl SchemaCache {
                     return SlotResult {
                         validator: Err(SchemaError::CompileError(e.to_string())),
                         warnings,
+                        cache_outcome,
                     };
                 }
             };
@@ -332,18 +344,24 @@ impl SchemaCache {
             SlotResult {
                 validator: Ok(Arc::new(validator)),
                 warnings,
+                cache_outcome,
             }
         });
 
         // Only the first caller to reach here takes the warnings.
-        let warnings = if !slot.warnings_taken.swap(true, Ordering::Relaxed) {
+        let is_first = !slot.warnings_taken.swap(true, Ordering::Relaxed);
+        let warnings = if is_first {
             result.warnings.clone()
         } else {
             vec![]
         };
 
+        // Only the initializing thread gets the real cache outcome;
+        // subsequent threads see None (already compiled in memory).
+        let cache_outcome = if is_first { result.cache_outcome } else { None };
+
         match &result.validator {
-            Ok(v) => Ok((Arc::clone(v), warnings)),
+            Ok(v) => Ok((Arc::clone(v), warnings, cache_outcome)),
             Err(e) => Err(e.clone()),
         }
     }

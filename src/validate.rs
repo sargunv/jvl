@@ -1,22 +1,13 @@
 use crate::diagnostic::{FileDiagnostic, FileResult, Severity, SourceLocation, Warning};
 use crate::parse::{self, ParsedFile};
-use crate::schema::{SchemaCache, SchemaError, SchemaSource};
+use crate::schema::{CacheOutcome, SchemaCache, SchemaError, SchemaSource};
 use std::path::Path;
-
-/// Result of schema resolution during validation.
-#[derive(Debug, Clone)]
-pub enum SchemaResolution {
-    /// Schema was provided externally (--schema flag or config mapping).
-    External,
-    /// Schema was resolved from a `$schema` field in the file.
-    Inline(SchemaSource),
-    /// No schema was found for this file.
-    None,
-}
 
 /// Validate a single file against a resolved schema.
 ///
-/// Returns `(file_result, warnings, schema_resolution)`.
+/// Returns `(file_result, warnings, cache_outcome)`. The `cache_outcome` is
+/// `None` for file-based schemas, skipped files, or when the compiled schema
+/// was already cached in memory by another thread.
 pub fn validate_file(
     file_path: &str,
     source: &str,
@@ -24,7 +15,7 @@ pub fn validate_file(
     schema_cache: &SchemaCache,
     no_cache: bool,
     strict: bool,
-) -> (FileResult, Vec<Warning>, SchemaResolution) {
+) -> (FileResult, Vec<Warning>, Option<CacheOutcome>) {
     let mut warnings = Vec::new();
 
     // Parse the file
@@ -56,27 +47,19 @@ pub fn validate_file(
                     }
                 })
                 .collect();
-            return (
-                FileResult::invalid(file_path, errors),
-                warnings,
-                SchemaResolution::None,
-            );
+            return (FileResult::invalid(file_path, errors), warnings, None);
         }
     };
 
     // Determine schema source: explicit override > $schema field in file > config mapping
-    let (effective_schema, schema_resolution) = if let Some(s) = schema_source {
-        (Some(s.clone()), SchemaResolution::External)
-    } else if let Some(schema_ref) = parse::extract_schema_field(&parsed.value) {
-        let base_dir = Path::new(file_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        let resolved = crate::schema::resolve_schema_ref(schema_ref, base_dir);
-        let resolution = SchemaResolution::Inline(resolved.clone());
-        (Some(resolved), resolution)
-    } else {
-        (None, SchemaResolution::None)
-    };
+    let effective_schema = schema_source.cloned().or_else(|| {
+        parse::extract_schema_field(&parsed.value).map(|schema_ref| {
+            let base_dir = Path::new(file_path)
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            crate::schema::resolve_schema_ref(schema_ref, base_dir)
+        })
+    });
 
     let Some(effective_schema) = effective_schema else {
         if strict {
@@ -99,18 +82,14 @@ pub fn validate_file(
                     }],
                 ),
                 warnings,
-                SchemaResolution::None,
+                None,
             );
         }
-        return (
-            FileResult::skipped(file_path),
-            warnings,
-            SchemaResolution::None,
-        );
+        return (FileResult::skipped(file_path), warnings, None);
     };
 
     // Load schema and get/compile the validator
-    let (validator, schema_warnings) =
+    let (validator, schema_warnings, cache_outcome) =
         match schema_cache.get_or_compile(&effective_schema, no_cache) {
             Ok(result) => result,
             Err(e) => {
@@ -133,7 +112,7 @@ pub fn validate_file(
                         }],
                     ),
                     warnings,
-                    schema_resolution,
+                    None,
                 );
             }
         };
@@ -143,14 +122,14 @@ pub fn validate_file(
     let validation_errors: Vec<_> = validator.iter_errors(&parsed.value).collect();
 
     if validation_errors.is_empty() {
-        return (FileResult::valid(file_path), warnings, schema_resolution);
+        return (FileResult::valid(file_path), warnings, cache_outcome);
     }
 
     let errors = map_validation_errors(&parsed, &validation_errors);
     (
         FileResult::invalid(file_path, errors),
         warnings,
-        schema_resolution,
+        cache_outcome,
     )
 }
 
