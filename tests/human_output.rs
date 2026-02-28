@@ -387,9 +387,23 @@ fn schema_load_error_points_at_schema_value() {
         stderr.contains("schema referenced here"),
         "expected 'schema referenced here' label in stderr: {stderr}"
     );
-    // The source header should point at line 2 (where $schema value is), not line 1 col 1.
+    // The source header should point at the $schema value (col 14), not (1,1).
     assert!(
-        stderr.contains(":2:14]"),
-        "expected source location :2:14 in stderr: {stderr}"
+        stderr.contains(":1:14]"),
+        "expected source location :1:14 in stderr: {stderr}"
+    );
+}
+
+#[test]
+fn schema_compile_error_points_at_schema_value() {
+    let (stderr, code) = jvl_human(&["check", &fixture("schema-compile-error.json")]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("schema referenced here"),
+        "expected 'schema referenced here' label in stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(":1:14]"),
+        "expected source location :1:14 in stderr: {stderr}"
     );
 }

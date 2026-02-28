@@ -354,9 +354,9 @@ fn schema_load_error_with_schema_field() {
     assert_eq!(errors.len(), 1);
     let error = &errors[0];
     assert_eq!(error["code"], "schema(load)");
-    // location should exist and point at the $schema value (line 2, column 14)
+    // location should exist and point at the $schema value (line 1, column 14)
     let loc = &error["location"];
-    assert_eq!(loc["line"], 2, "expected line 2");
+    assert_eq!(loc["line"], 1, "expected line 1");
     assert_eq!(loc["column"], 14, "expected column 14");
     assert!(
         loc["length"].as_u64().unwrap() > 0,
@@ -385,6 +385,30 @@ fn schema_load_error_with_flag_no_location() {
     assert!(
         error.get("location").is_none() || error["location"].is_null(),
         "expected no location for --schema flag errors"
+    );
+}
+
+#[test]
+fn schema_compile_error_with_schema_field() {
+    let (json, code) = jvl_json(&[
+        "check",
+        "--format",
+        "json",
+        &fixture("schema-compile-error.json"),
+    ]);
+
+    assert_eq!(code, 2);
+    let errors = json["files"][0]["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    let error = &errors[0];
+    assert_eq!(error["code"], "schema(compile)");
+    // location should exist and point at the $schema value
+    let loc = &error["location"];
+    assert_eq!(loc["line"], 1, "expected line 1");
+    assert_eq!(loc["column"], 14, "expected column 14");
+    assert!(
+        loc["length"].as_u64().unwrap() > 0,
+        "expected nonzero length"
     );
 }
 
