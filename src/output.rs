@@ -51,6 +51,18 @@ fn plural(n: usize, singular: &str, plural_form: &str) -> String {
     }
 }
 
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MiB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KiB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn format_duration(d: Duration) -> String {
     let ms = d.as_millis();
     if ms < 1000 {

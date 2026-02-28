@@ -11,7 +11,7 @@ use jvl::diagnostic::{FileResult, ToolDiagnostic, Warning};
 use jvl::discover::{self, CompiledSchemaMappings, Config};
 use jvl::output::{self, Format, Summary, VerboseFileInfo};
 use jvl::parse;
-use jvl::schema::SchemaCache;
+use jvl::schema::{self, SchemaCache};
 use jvl::validate;
 
 #[derive(Parser)]
@@ -32,6 +32,12 @@ enum Commands {
         command: ConfigCommands,
     },
 
+    /// Manage the schema cache
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -46,6 +52,25 @@ enum ConfigCommands {
 
     /// Print the JSON Schema for jvl.json config files
     Schema,
+}
+
+#[derive(Subcommand)]
+enum CacheCommands {
+    /// Print the cache directory path
+    Dir,
+
+    /// List cached schemas
+    List(CacheListArgs),
+
+    /// Clear all cached schemas
+    Clear,
+}
+
+#[derive(clap::Args)]
+struct CacheListArgs {
+    /// Output format
+    #[arg(short = 'f', long, value_enum, default_value = "human")]
+    format: Format,
 }
 
 #[derive(clap::Args)]
@@ -97,6 +122,11 @@ fn main() -> ExitCode {
         Commands::Config { command } => match command {
             ConfigCommands::Print(args) => run_config_print(args),
             ConfigCommands::Schema => run_config_schema(),
+        },
+        Commands::Cache { command } => match command {
+            CacheCommands::Dir => run_cache_dir(),
+            CacheCommands::List(args) => run_cache_list(args),
+            CacheCommands::Clear => run_cache_clear(),
         },
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "jvl", &mut std::io::stdout());
@@ -175,6 +205,124 @@ fn rename_definitions(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+fn run_cache_dir() -> ExitCode {
+    match schema::cache_dir() {
+        Some(dir) => {
+            println!("{}", dir.display());
+            ExitCode::SUCCESS
+        }
+        None => {
+            let mut stderr = std::io::stderr().lock();
+            let diag = ToolDiagnostic::error("cannot determine cache directory".to_string());
+            let _ = writeln!(stderr, "{:?}", miette::Report::new(diag));
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_cache_list(args: CacheListArgs) -> ExitCode {
+    let result = match schema::list_cached_schemas() {
+        Ok(r) => r,
+        Err(e) => {
+            let mut stderr = std::io::stderr().lock();
+            let diag = ToolDiagnostic::error(format!("cannot list cached schemas: {e}"));
+            let _ = writeln!(stderr, "{:?}", miette::Report::new(diag));
+            return ExitCode::from(2);
+        }
+    };
+
+    match args.format {
+        Format::Human => {
+            for entry in &result.entries {
+                println!(
+                    "{} ({}, {})",
+                    entry.url,
+                    output::format_bytes(entry.size),
+                    entry.fetched_at,
+                );
+            }
+
+            if result.entries.is_empty() {
+                eprintln!("(cache is empty)");
+            } else {
+                let total_size: u64 = result.entries.iter().map(|e| e.size).sum();
+                eprintln!(
+                    "{} cached schema{}, {} total",
+                    result.entries.len(),
+                    if result.entries.len() == 1 { "" } else { "s" },
+                    output::format_bytes(total_size),
+                );
+            }
+
+            if result.skipped > 0 {
+                eprintln!(
+                    "warning: {} corrupt cache entr{} skipped",
+                    result.skipped,
+                    if result.skipped == 1 { "y" } else { "ies" },
+                );
+            }
+        }
+        Format::Json => {
+            #[derive(serde::Serialize)]
+            struct JsonCacheList {
+                entries: Vec<JsonCacheEntry>,
+                count: usize,
+                total_size: u64,
+                skipped: usize,
+            }
+
+            #[derive(serde::Serialize)]
+            struct JsonCacheEntry {
+                url: String,
+                fetched_at: String,
+                size: u64,
+            }
+
+            let total_size: u64 = result.entries.iter().map(|e| e.size).sum();
+            let count = result.entries.len();
+            let entries: Vec<JsonCacheEntry> = result
+                .entries
+                .into_iter()
+                .map(|e| JsonCacheEntry {
+                    url: e.url,
+                    fetched_at: e.fetched_at,
+                    size: e.size,
+                })
+                .collect();
+
+            let output = JsonCacheList {
+                entries,
+                count,
+                total_size,
+                skipped: result.skipped,
+            };
+
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn run_cache_clear() -> ExitCode {
+    match schema::clear_cache() {
+        Ok(schema::CacheClearResult::Cleared) => {
+            eprintln!("cache cleared");
+            ExitCode::SUCCESS
+        }
+        Ok(schema::CacheClearResult::AlreadyEmpty) => {
+            eprintln!("cache is already empty");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let mut stderr = std::io::stderr().lock();
+            let diag = ToolDiagnostic::error(format!("failed to clear cache: {e}"));
+            let _ = writeln!(stderr, "{:?}", miette::Report::new(diag));
+            ExitCode::from(2)
+        }
     }
 }
 

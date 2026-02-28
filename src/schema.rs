@@ -108,7 +108,7 @@ pub fn resolve_schema_ref(schema_ref: &str, base_dir: &Path) -> SchemaSource {
 }
 
 /// Cache directory for fetched schemas.
-fn cache_dir() -> Option<PathBuf> {
+pub fn cache_dir() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("jvl").join("schemas"))
 }
 
@@ -119,13 +119,40 @@ fn url_hash(url: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Metadata for a cached schema.
+/// Metadata for a cached schema (internal on-disk format).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct CacheMeta {
     url: String,
     fetched_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     etag: Option<String>,
+}
+
+/// Information about a single cached schema entry.
+#[derive(Debug)]
+pub struct CachedSchemaInfo {
+    /// The original URL of the cached schema.
+    pub url: String,
+    /// ISO 8601 timestamp of when the schema was fetched.
+    pub fetched_at: String,
+    /// Size of the cached schema content in bytes.
+    pub size: u64,
+}
+
+/// Result of listing cached schemas.
+pub struct CacheListResult {
+    /// Successfully read cache entries, sorted by URL.
+    pub entries: Vec<CachedSchemaInfo>,
+    /// Number of `.meta` files that could not be read or parsed.
+    pub skipped: usize,
+}
+
+/// Result of clearing the cache.
+pub enum CacheClearResult {
+    /// Cache was cleared successfully.
+    Cleared,
+    /// Cache directory did not exist (already empty).
+    AlreadyEmpty,
 }
 
 /// TTL for cached schemas: 24 hours.
@@ -267,6 +294,111 @@ fn write_cache(base: &Path, hash: &str, url: &str, content: &str) -> Result<(), 
     let meta_json = serde_json::to_string_pretty(&meta).unwrap();
     fs::write(&meta_path, meta_json)?;
     Ok(())
+}
+
+/// List all cached schemas from the disk cache.
+///
+/// Returns entries sorted by URL. Entries with corrupt or unreadable `.meta`
+/// files are counted in `skipped` rather than silently ignored.
+pub fn list_cached_schemas() -> Result<CacheListResult, std::io::Error> {
+    let dir = cache_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot determine cache directory",
+        )
+    })?;
+
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CacheListResult {
+                entries: vec![],
+                skipped: 0,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut infos: Vec<CachedSchemaInfo> = Vec::new();
+    let mut skipped: usize = 0;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+            continue;
+        }
+
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let meta: CacheMeta = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let json_path = path.with_extension("json");
+        let size = fs::metadata(&json_path).map(|m| m.len()).unwrap_or(0);
+
+        infos.push(CachedSchemaInfo {
+            url: meta.url,
+            fetched_at: meta.fetched_at,
+            size,
+        });
+    }
+
+    infos.sort_unstable_by(|a, b| a.url.cmp(&b.url));
+
+    Ok(CacheListResult {
+        entries: infos,
+        skipped,
+    })
+}
+
+/// Clear all cached schemas from the disk cache.
+///
+/// Refuses to operate if the cache directory is a symlink (defense-in-depth).
+pub fn clear_cache() -> Result<CacheClearResult, std::io::Error> {
+    let dir = cache_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot determine cache directory",
+        )
+    })?;
+
+    // Check for symlink before deletion (defense-in-depth).
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cache directory is a symlink; refusing to clear",
+            ));
+        }
+        Ok(_) => {} // real directory, proceed
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CacheClearResult::AlreadyEmpty);
+        }
+        Err(e) => return Err(e),
+    }
+
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(CacheClearResult::Cleared),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CacheClearResult::AlreadyEmpty),
+        Err(e) => Err(e),
+    }
 }
 
 /// Thread-safe cache of compiled schema validators.
