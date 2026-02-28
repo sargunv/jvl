@@ -152,6 +152,19 @@ pub fn extract_schema_field(value: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// Extract the `$schema` field from raw JSONC source without full parsing.
+///
+/// This is a lightweight helper for verbose diagnostics — it parses the source
+/// just enough to pull the `$schema` string value. Returns an owned `String`
+/// since the parsed value is temporary.
+pub fn extract_schema_field_from_str(source: &str) -> Option<String> {
+    let source = strip_bom(source);
+    let result = parse_to_ast(source, &Default::default(), &parse_options()).ok()?;
+    let ast = result.value?;
+    let value: serde_json::Value = ast.into();
+    extract_schema_field(&value).map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
