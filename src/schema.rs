@@ -453,7 +453,11 @@ impl SchemaCache {
     ///
     /// Returns `true` if the source was present in the cache.
     pub fn evict(&self, source: &SchemaSource) -> bool {
-        self.slots.lock().unwrap().remove(source).is_some()
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(source)
+            .is_some()
     }
 
     /// Get or load+compile a schema validator.
@@ -469,7 +473,7 @@ impl SchemaCache {
         no_cache: bool,
     ) -> Result<CompileResult, SchemaError> {
         let slot = {
-            let mut slots = self.slots.lock().unwrap();
+            let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
             slots
                 .entry(source.clone())
                 .or_insert_with(|| {
