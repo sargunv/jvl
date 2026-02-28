@@ -50,6 +50,14 @@ impl CacheOutcome {
     }
 }
 
+/// The result of compiling (or retrieving) a schema: the compiled validator,
+/// any warnings emitted during compilation, and an optional cache outcome.
+pub type CompileResult = (
+    Arc<jsonschema::Validator>,
+    Vec<Warning>,
+    Option<CacheOutcome>,
+);
+
 #[derive(Debug, Clone, Error)]
 pub enum SchemaError {
     #[error("Failed to read schema file '{path}': {reason}")]
@@ -298,14 +306,7 @@ impl SchemaCache {
         &self,
         source: &SchemaSource,
         no_cache: bool,
-    ) -> Result<
-        (
-            Arc<jsonschema::Validator>,
-            Vec<Warning>,
-            Option<CacheOutcome>,
-        ),
-        SchemaError,
-    > {
+    ) -> Result<CompileResult, SchemaError> {
         let slot = {
             let mut slots = self.slots.lock().unwrap();
             slots
