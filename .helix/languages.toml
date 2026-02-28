@@ -1,0 +1,7 @@
+[[language]]
+name = "json"
+language-servers = ["jvl"]
+
+[language-server.jvl]
+command = "cargo"
+args = ["run", "--quiet", "--", "lsp"]
