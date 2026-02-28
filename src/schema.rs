@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,23 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::diagnostic::Warning;
+
+/// Describes how a URL schema was resolved from cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOutcome {
+    /// Schema was served from a fresh cache entry.
+    Hit,
+    /// Schema was not in cache and was fetched from the network.
+    Miss,
+    /// Cache entry was stale; a re-fetch was attempted.
+    Stale,
+    /// Cache was explicitly bypassed via --no-cache.
+    Bypassed,
+}
+
+thread_local! {
+    static LAST_CACHE_OUTCOME: Cell<Option<CacheOutcome>> = const { Cell::new(None) };
+}
 
 #[derive(Debug, Clone, Error)]
 pub enum SchemaError {
@@ -92,6 +110,8 @@ pub fn load_schema_content(
     source: &SchemaSource,
     no_cache: bool,
 ) -> Result<(String, Vec<Warning>), SchemaError> {
+    // Reset the thread-local cache outcome before each load.
+    LAST_CACHE_OUTCOME.set(None);
     match source {
         SchemaSource::File(path) => {
             let content = fs::read_to_string(path).map_err(|e| SchemaError::FileRead {
@@ -108,6 +128,7 @@ fn load_url_schema(url: &str, no_cache: bool) -> Result<(String, Vec<Warning>), 
     let hash = url_hash(url);
 
     if no_cache {
+        LAST_CACHE_OUTCOME.set(Some(CacheOutcome::Bypassed));
         let content = fetch_url(url)?;
         return Ok((content, vec![]));
     }
@@ -124,11 +145,13 @@ fn load_url_schema(url: &str, no_cache: bool) -> Result<(String, Vec<Warning>), 
 
             if let Some(content) = cached_content {
                 if is_within_ttl(&meta_path) {
+                    LAST_CACHE_OUTCOME.set(Some(CacheOutcome::Hit));
                     return Ok((content, vec![]));
                 }
 
                 // Stale: attempt re-fetch. Use fresh content if successful,
                 // fall back to stale content on failure.
+                LAST_CACHE_OUTCOME.set(Some(CacheOutcome::Stale));
                 match fetch_url(url) {
                     Ok(fresh) => {
                         let _ = write_cache(base, &hash, url, &fresh);
@@ -149,6 +172,7 @@ fn load_url_schema(url: &str, no_cache: bool) -> Result<(String, Vec<Warning>), 
     }
 
     // No cache hit — fetch synchronously
+    LAST_CACHE_OUTCOME.set(Some(CacheOutcome::Miss));
     let content = fetch_url(url)?;
 
     // Write to cache
@@ -239,6 +263,11 @@ struct SlotResult {
 impl SchemaCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read the last cache outcome for the calling thread (set during schema loading).
+    pub fn last_cache_outcome(&self) -> Option<CacheOutcome> {
+        LAST_CACHE_OUTCOME.get()
     }
 
     /// Get or load+compile a schema validator.

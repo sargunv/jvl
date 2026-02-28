@@ -5,14 +5,15 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use jvl::diagnostic::{FileResult, ToolDiagnostic, Warning};
 use jvl::discover::{self, CompiledSchemaMappings, Config};
 use jvl::output::{self, Format, Summary};
 use jvl::parse;
-use jvl::schema::SchemaCache;
-use jvl::validate;
+use jvl::schema::{CacheOutcome, SchemaCache};
+use jvl::validate::{self, SchemaResolution};
 
 #[derive(Parser)]
 #[command(name = "jvl", version, about = "JSON Schema Validator")]
@@ -83,6 +84,10 @@ struct CheckArgs {
     /// Bypass schema cache; always fetch from network
     #[arg(long)]
     no_cache: bool,
+
+    /// Print verbose diagnostic information to stderr
+    #[arg(short = 'v', long)]
+    verbose: bool,
 }
 
 fn main() -> ExitCode {
@@ -178,12 +183,17 @@ fn run_check(args: CheckArgs) -> ExitCode {
     let start = Instant::now();
     let mut stderr = std::io::stderr().lock();
     let mut early_warnings: Vec<Warning> = Vec::new();
+    let verbose = args.verbose && args.format == Format::Human;
 
     // Configure rayon thread pool
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.jobs as usize)
         .build_global()
         .ok(); // Ignore if already initialized
+
+    if verbose {
+        verbose_log(&mut stderr, &format!("jobs: {}", args.jobs));
+    }
 
     // Resolve config
     let cwd = match std::env::current_dir() {
@@ -204,6 +214,30 @@ fn run_check(args: CheckArgs) -> ExitCode {
     };
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
 
+    if verbose {
+        match (&loaded_config, &args.config) {
+            (Some(_), Some(path)) => {
+                verbose_log(&mut stderr, &format!("config: {}", path.display()));
+            }
+            (Some(_), None) => {
+                verbose_log(
+                    &mut stderr,
+                    &format!(
+                        "config: {} (auto-discovered)",
+                        project_root.join("jvl.json").display()
+                    ),
+                );
+            }
+            (None, _) => {
+                verbose_log(&mut stderr, "config: none found, using defaults");
+            }
+        }
+        verbose_log(
+            &mut stderr,
+            &format!("project root: {}", project_root.display()),
+        );
+    }
+
     let config = loaded_config.unwrap_or_else(Config::default_config);
 
     // Pre-compile schema mappings once
@@ -223,10 +257,19 @@ fn run_check(args: CheckArgs) -> ExitCode {
 
     // Discover files
     let files_to_check = if args.files.is_empty() {
+        if verbose {
+            verbose_log(
+                &mut stderr,
+                &format!("discovering files in: {}", cwd.display()),
+            );
+        }
         // No explicit arguments: discover from cwd
         match discover::discover_files(&project_root, std::slice::from_ref(&cwd), &config) {
             Ok((files, walk_warnings)) => {
                 early_warnings.extend(walk_warnings);
+                if verbose {
+                    verbose_log(&mut stderr, &format!("discovered {} files", files.len()));
+                }
                 files
             }
             Err(e) => {
@@ -253,10 +296,33 @@ fn run_check(args: CheckArgs) -> ExitCode {
             }
         }
 
+        if verbose {
+            if !explicit_files.is_empty() {
+                verbose_log(
+                    &mut stderr,
+                    &format!("{} explicit files", explicit_files.len()),
+                );
+            }
+            if !walk_roots.is_empty() {
+                for root in &walk_roots {
+                    verbose_log(
+                        &mut stderr,
+                        &format!("discovering files in: {}", root.display()),
+                    );
+                }
+            }
+        }
+
         if !walk_roots.is_empty() {
             match discover::discover_files(&project_root, &walk_roots, &config) {
                 Ok((files, walk_warnings)) => {
                     early_warnings.extend(walk_warnings);
+                    if verbose {
+                        verbose_log(
+                            &mut stderr,
+                            &format!("discovered {} files from directories", files.len()),
+                        );
+                    }
                     explicit_files.extend(files);
                 }
                 Err(e) => {
@@ -309,9 +375,12 @@ fn run_check(args: CheckArgs) -> ExitCode {
         .collect();
 
     // Process files in parallel, collecting results without mutexes
+    let verbose_messages: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let par_results: Vec<(FileResult, Vec<Warning>)> = file_contents
         .par_iter()
         .map(|(path, content)| {
+            let file_start = Instant::now();
+
             // Determine schema for this file
             let effective_schema = if let Some(ref s) = schema_override_source {
                 Some(s.clone())
@@ -328,16 +397,71 @@ fn run_check(args: CheckArgs) -> ExitCode {
                 compiled_mappings.resolve(&relative, &project_root)
             };
 
-            validate::validate_file(
+            let (result, file_warnings, schema_resolution) = validate::validate_file(
                 path,
                 content,
                 effective_schema.as_ref(),
                 &schema_cache,
                 args.no_cache,
                 args.strict,
-            )
+            );
+
+            if verbose {
+                let file_duration = file_start.elapsed();
+
+                let schema_info = match &schema_resolution {
+                    SchemaResolution::External => {
+                        let source = effective_schema.as_ref().unwrap();
+                        let via = if schema_override_source.is_some() {
+                            "flag"
+                        } else {
+                            "config"
+                        };
+                        format!("{source} (via {via})")
+                    }
+                    SchemaResolution::Inline(source) => {
+                        format!("{source} (via inline $schema)")
+                    }
+                    SchemaResolution::None => "none".to_string(),
+                };
+
+                let status = if result.skipped {
+                    "skipped (no schema)"
+                } else if result.valid {
+                    "valid"
+                } else if result.tool_error {
+                    "error"
+                } else {
+                    "invalid"
+                };
+
+                let cache_info = schema_cache.last_cache_outcome().map_or(
+                    String::new(),
+                    |outcome| match outcome {
+                        CacheOutcome::Hit => " cache=hit".to_string(),
+                        CacheOutcome::Miss => " cache=miss".to_string(),
+                        CacheOutcome::Stale => " cache=stale".to_string(),
+                        CacheOutcome::Bypassed => " cache=bypassed".to_string(),
+                    },
+                );
+
+                verbose_messages.lock().unwrap().push(format!(
+                    "{path}: {status} | schema: {schema_info} | {:.0?}{cache_info}",
+                    file_duration,
+                ));
+            }
+
+            (result, file_warnings)
         })
         .collect();
+
+    // Render verbose per-file messages before results
+    if verbose {
+        let messages = verbose_messages.into_inner().unwrap();
+        for msg in &messages {
+            verbose_log(&mut stderr, msg);
+        }
+    }
 
     let mut results = Vec::with_capacity(par_results.len());
     let mut warnings = early_warnings;
@@ -384,6 +508,18 @@ fn run_check(args: CheckArgs) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Write a verbose diagnostic message to stderr with dimmed styling.
+fn verbose_log(stderr: &mut impl Write, msg: &str) {
+    use owo_colors::OwoColorize;
+    use owo_colors::Stream::Stderr;
+    let line = format!("[verbose] {msg}");
+    let _ = writeln!(
+        stderr,
+        "{}",
+        line.if_supports_color(Stderr, |text| text.dimmed())
+    );
 }
 
 /// Load config, returning an error if the config fails to parse.

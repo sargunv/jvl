@@ -3,9 +3,20 @@ use crate::parse::{self, ParsedFile};
 use crate::schema::{SchemaCache, SchemaError, SchemaSource};
 use std::path::Path;
 
+/// Result of schema resolution during validation.
+#[derive(Debug, Clone)]
+pub enum SchemaResolution {
+    /// Schema was provided externally (--schema flag or config mapping).
+    External,
+    /// Schema was resolved from a `$schema` field in the file.
+    Inline(SchemaSource),
+    /// No schema was found for this file.
+    None,
+}
+
 /// Validate a single file against a resolved schema.
 ///
-/// Returns the file result and any warnings generated during validation.
+/// Returns `(file_result, warnings, schema_resolution)`.
 pub fn validate_file(
     file_path: &str,
     source: &str,
@@ -13,7 +24,7 @@ pub fn validate_file(
     schema_cache: &SchemaCache,
     no_cache: bool,
     strict: bool,
-) -> (FileResult, Vec<Warning>) {
+) -> (FileResult, Vec<Warning>, SchemaResolution) {
     let mut warnings = Vec::new();
 
     // Parse the file
@@ -45,19 +56,27 @@ pub fn validate_file(
                     }
                 })
                 .collect();
-            return (FileResult::invalid(file_path, errors), warnings);
+            return (
+                FileResult::invalid(file_path, errors),
+                warnings,
+                SchemaResolution::None,
+            );
         }
     };
 
     // Determine schema source: explicit override > $schema field in file > config mapping
-    let effective_schema = schema_source.cloned().or_else(|| {
-        parse::extract_schema_field(&parsed.value).map(|schema_ref| {
-            let base_dir = Path::new(file_path)
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
-            crate::schema::resolve_schema_ref(schema_ref, base_dir)
-        })
-    });
+    let (effective_schema, schema_resolution) = if let Some(s) = schema_source {
+        (Some(s.clone()), SchemaResolution::External)
+    } else if let Some(schema_ref) = parse::extract_schema_field(&parsed.value) {
+        let base_dir = Path::new(file_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let resolved = crate::schema::resolve_schema_ref(schema_ref, base_dir);
+        let resolution = SchemaResolution::Inline(resolved.clone());
+        (Some(resolved), resolution)
+    } else {
+        (None, SchemaResolution::None)
+    };
 
     let Some(effective_schema) = effective_schema else {
         if strict {
@@ -80,9 +99,14 @@ pub fn validate_file(
                     }],
                 ),
                 warnings,
+                SchemaResolution::None,
             );
         }
-        return (FileResult::skipped(file_path), warnings);
+        return (
+            FileResult::skipped(file_path),
+            warnings,
+            SchemaResolution::None,
+        );
     };
 
     // Load schema and get/compile the validator
@@ -109,6 +133,7 @@ pub fn validate_file(
                         }],
                     ),
                     warnings,
+                    schema_resolution,
                 );
             }
         };
@@ -118,11 +143,15 @@ pub fn validate_file(
     let validation_errors: Vec<_> = validator.iter_errors(&parsed.value).collect();
 
     if validation_errors.is_empty() {
-        return (FileResult::valid(file_path), warnings);
+        return (FileResult::valid(file_path), warnings, schema_resolution);
     }
 
     let errors = map_validation_errors(&parsed, &validation_errors);
-    (FileResult::invalid(file_path, errors), warnings)
+    (
+        FileResult::invalid(file_path, errors),
+        warnings,
+        schema_resolution,
+    )
 }
 
 /// Map jsonschema validation errors to our diagnostic format.
