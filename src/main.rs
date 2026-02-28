@@ -415,7 +415,7 @@ fn run_check(args: CheckArgs) -> ExitCode {
                 }
             };
 
-            let (result, file_warnings, cache_outcome) = validate::validate_file(
+            let (result, file_warnings, cache_outcome, timing) = validate::validate_file(
                 path,
                 content,
                 effective_schema.as_ref(),
@@ -471,10 +471,17 @@ fn run_check(args: CheckArgs) -> ExitCode {
                     let cache_info =
                         cache_outcome.map_or(String::new(), |c| format!(" cache={}", c.as_str()));
 
+                    let timing_detail = timing.as_ref().map_or(String::new(), |t| {
+                        format!(
+                            " (compile={:.0?}, validate={:.0?})",
+                            t.compile, t.validate,
+                        )
+                    });
+
                     output::verbose_log(
                         &mut std::io::stderr(),
                         &format!(
-                            "{}: {status} | schema: {schema_info} | {:.0?}{cache_info}",
+                            "{}: {status} | schema: {schema_info} | {:.0?}{timing_detail}{cache_info}",
                             result.path, file_duration,
                         ),
                     );
@@ -485,6 +492,8 @@ fn run_check(args: CheckArgs) -> ExitCode {
                     schema_via: via,
                     cache: cache_outcome,
                     duration: file_duration,
+                    compile_duration: timing.as_ref().map(|t| t.compile),
+                    validate_duration: timing.as_ref().map(|t| t.validate),
                 })
             } else {
                 None

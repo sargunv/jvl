@@ -2,12 +2,23 @@ use crate::diagnostic::{FileDiagnostic, FileResult, Severity, SourceLocation, Wa
 use crate::parse::{self, ParsedFile};
 use crate::schema::{CacheOutcome, SchemaCache, SchemaError, SchemaSource};
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Timing breakdown for schema compilation and validation.
+#[derive(Debug, Clone, Copy)]
+pub struct TimingBreakdown {
+    /// Time spent loading + compiling the schema (including $ref resolution).
+    pub compile: Duration,
+    /// Time spent validating the document against the compiled schema.
+    pub validate: Duration,
+}
 
 /// Validate a single file against a resolved schema.
 ///
-/// Returns `(file_result, warnings, cache_outcome)`. The `cache_outcome` is
-/// `None` for file-based schemas, skipped files, or when the compiled schema
-/// was already cached in memory by another thread.
+/// Returns `(file_result, warnings, cache_outcome, timing)`. The `cache_outcome`
+/// is `None` for file-based schemas, skipped files, or when the compiled schema
+/// was already cached in memory by another thread. `timing` is `None` when the
+/// file is skipped or has parse errors.
 pub fn validate_file(
     file_path: &str,
     source: &str,
@@ -15,7 +26,12 @@ pub fn validate_file(
     schema_cache: &SchemaCache,
     no_cache: bool,
     strict: bool,
-) -> (FileResult, Vec<Warning>, Option<CacheOutcome>) {
+) -> (
+    FileResult,
+    Vec<Warning>,
+    Option<CacheOutcome>,
+    Option<TimingBreakdown>,
+) {
     let mut warnings = Vec::new();
 
     // Parse the file
@@ -47,7 +63,7 @@ pub fn validate_file(
                     }
                 })
                 .collect();
-            return (FileResult::invalid(file_path, errors), warnings, None);
+            return (FileResult::invalid(file_path, errors), warnings, None, None);
         }
     };
 
@@ -83,12 +99,14 @@ pub fn validate_file(
                 ),
                 warnings,
                 None,
+                None,
             );
         }
-        return (FileResult::skipped(file_path), warnings, None);
+        return (FileResult::skipped(file_path), warnings, None, None);
     };
 
     // Load schema and get/compile the validator
+    let compile_start = Instant::now();
     let (validator, schema_warnings, cache_outcome) =
         match schema_cache.get_or_compile(&effective_schema, no_cache) {
             Ok(result) => result,
@@ -113,16 +131,30 @@ pub fn validate_file(
                     ),
                     warnings,
                     None,
+                    None,
                 );
             }
         };
+    let compile_duration = compile_start.elapsed();
     warnings.extend(schema_warnings);
 
     // Validate
+    let validate_start = Instant::now();
     let validation_errors: Vec<_> = validator.iter_errors(&parsed.value).collect();
+    let validate_duration = validate_start.elapsed();
+
+    let timing = Some(TimingBreakdown {
+        compile: compile_duration,
+        validate: validate_duration,
+    });
 
     if validation_errors.is_empty() {
-        return (FileResult::valid(file_path), warnings, cache_outcome);
+        return (
+            FileResult::valid(file_path),
+            warnings,
+            cache_outcome,
+            timing,
+        );
     }
 
     let errors = map_validation_errors(&parsed, &validation_errors);
@@ -130,6 +162,7 @@ pub fn validate_file(
         FileResult::invalid(file_path, errors),
         warnings,
         cache_outcome,
+        timing,
     )
 }
 

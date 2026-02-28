@@ -35,8 +35,12 @@ pub struct VerboseFileInfo {
     pub schema_via: String,
     /// Disk-cache outcome for URL schemas, `None` for file schemas or in-memory hits.
     pub cache: Option<CacheOutcome>,
-    /// Time spent validating this file.
+    /// Total time spent on this file.
     pub duration: Duration,
+    /// Time spent loading + compiling the schema.
+    pub compile_duration: Option<Duration>,
+    /// Time spent validating the document.
+    pub validate_duration: Option<Duration>,
 }
 
 fn plural(n: usize, singular: &str, plural_form: &str) -> String {
@@ -188,6 +192,10 @@ struct JsonFileResult {
     cache: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compile_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validate_ms: Option<u64>,
     errors: Vec<JsonError>,
 }
 
@@ -269,26 +277,40 @@ fn build_json_output<'a>(
                 })
                 .collect();
 
-            let (schema, schema_via, cache, duration_ms) = if let Some(infos) = verbose_infos
-                && let Some(Some(info)) = infos.get(i)
-            {
-                let schema = if info.schema.is_empty() {
-                    None
+            let (schema, schema_via, cache, duration_ms, compile_ms, validate_ms) =
+                if let Some(infos) = verbose_infos
+                    && let Some(Some(info)) = infos.get(i)
+                {
+                    let schema = if info.schema.is_empty() {
+                        None
+                    } else {
+                        Some(info.schema.clone())
+                    };
+                    let schema_via = if info.schema_via.is_empty() {
+                        None
+                    } else {
+                        Some(info.schema_via.clone())
+                    };
+                    let cache = info.cache.map(|c| c.as_str().to_string());
+                    let duration_ms =
+                        Some(u64::try_from(info.duration.as_millis()).unwrap_or(u64::MAX));
+                    let compile_ms = info
+                        .compile_duration
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                    let validate_ms = info
+                        .validate_duration
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                    (
+                        schema,
+                        schema_via,
+                        cache,
+                        duration_ms,
+                        compile_ms,
+                        validate_ms,
+                    )
                 } else {
-                    Some(info.schema.clone())
+                    (None, None, None, None, None, None)
                 };
-                let schema_via = if info.schema_via.is_empty() {
-                    None
-                } else {
-                    Some(info.schema_via.clone())
-                };
-                let cache = info.cache.map(|c| c.as_str().to_string());
-                let duration_ms =
-                    Some(u64::try_from(info.duration.as_millis()).unwrap_or(u64::MAX));
-                (schema, schema_via, cache, duration_ms)
-            } else {
-                (None, None, None, None)
-            };
 
             JsonFileResult {
                 path: r.path.clone(),
@@ -297,6 +319,8 @@ fn build_json_output<'a>(
                 schema_via,
                 cache,
                 duration_ms,
+                compile_ms,
+                validate_ms,
                 errors,
             }
         })
