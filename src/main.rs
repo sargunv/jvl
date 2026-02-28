@@ -85,7 +85,7 @@ struct ConfigPrintArgs {
 
 #[derive(clap::Args)]
 struct CheckArgs {
-    /// File paths to validate
+    /// File paths to validate (use - to read from stdin)
     files: Vec<PathBuf>,
 
     /// Schema to validate all files against (path or URL)
@@ -417,8 +417,26 @@ fn run_check(args: CheckArgs) -> ExitCode {
         .schema
         .map(|s| jvl::schema::resolve_schema_ref(&s, &cwd));
 
+    // Detect stdin input (-) before partitioning file args.
+    let stdin_content: Option<(String, String)> = if args.files.iter().any(|p| p.as_os_str() == "-")
+    {
+        use std::io::Read;
+        let mut raw = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
+            let diag = ToolDiagnostic::error(format!("failed to read stdin: {e}"));
+            let _ = writeln!(stderr, "{:?}", miette::Report::new(diag));
+            return ExitCode::from(2);
+        }
+        Some(("<stdin>".to_string(), parse::strip_bom(&raw).to_owned()))
+    } else {
+        None
+    };
+
+    // Filter out - from explicit file args so it doesn't go through normal file resolution.
+    let file_args: Vec<&PathBuf> = args.files.iter().filter(|p| p.as_os_str() != "-").collect();
+
     // Discover files
-    let files_to_check = if args.files.is_empty() {
+    let files_to_check = if file_args.is_empty() && stdin_content.is_none() {
         if verbose && args.format == Format::Human {
             output::verbose_log(
                 &mut stderr,
@@ -453,16 +471,16 @@ fn run_check(args: CheckArgs) -> ExitCode {
         let mut walk_roots: Vec<PathBuf> = Vec::new();
         let mut explicit_files: Vec<PathBuf> = Vec::new();
 
-        for path in &args.files {
+        for path in &file_args {
             let resolved = if path.is_absolute() {
-                path.clone()
+                path.to_path_buf()
             } else {
                 cwd.join(path)
             };
             if resolved.is_dir() {
                 walk_roots.push(resolved);
             } else {
-                explicit_files.push(path.clone());
+                explicit_files.push(path.to_path_buf());
             }
         }
 
@@ -511,7 +529,7 @@ fn run_check(args: CheckArgs) -> ExitCode {
         explicit_files
     };
 
-    if files_to_check.is_empty() {
+    if files_to_check.is_empty() && stdin_content.is_none() {
         if args.format == Format::Human {
             let diag = ToolDiagnostic::warning("no files to check".to_string());
             let _ = writeln!(stderr, "{:?}", miette::Report::new(diag));
@@ -522,24 +540,27 @@ fn run_check(args: CheckArgs) -> ExitCode {
     // Read all file contents upfront, stripping BOM at read time so all
     // downstream byte offsets are consistent with the stored source.
     let mut has_file_read_error = false;
-    let file_contents: Vec<(String, String)> = files_to_check
-        .iter()
-        .filter_map(|path| {
-            let path_str = path.display().to_string();
-            match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    let content = parse::strip_bom(&content).to_owned();
-                    Some((path_str, content))
-                }
-                Err(e) => {
-                    let diag = ToolDiagnostic::error(format!("could not read {path_str}: {e}"));
-                    let _ = writeln!(stderr, "{:?}", miette::Report::new(diag));
-                    has_file_read_error = true;
-                    None
-                }
+    let mut file_contents: Vec<(String, String)> = Vec::new();
+
+    // Inject stdin content first if present.
+    if let Some(entry) = stdin_content {
+        file_contents.push(entry);
+    }
+
+    for path in &files_to_check {
+        let path_str = path.display().to_string();
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let content = parse::strip_bom(&content).to_owned();
+                file_contents.push((path_str, content));
             }
-        })
-        .collect();
+            Err(e) => {
+                let diag = ToolDiagnostic::error(format!("could not read {path_str}: {e}"));
+                let _ = writeln!(stderr, "{:?}", miette::Report::new(diag));
+                has_file_read_error = true;
+            }
+        }
+    }
 
     let schema_cache = SchemaCache::new();
 

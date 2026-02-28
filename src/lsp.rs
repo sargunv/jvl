@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -15,13 +16,6 @@ use crate::parse;
 use crate::schema::{SchemaCache, SchemaSource};
 use crate::validate;
 
-/// Negotiated position encoding for LSP diagnostic positions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NegotiatedEncoding {
-    Utf8,
-    Utf16,
-}
-
 /// Compiled jvl.json config with resolved schema mappings.
 struct CompiledConfig {
     mappings: CompiledSchemaMappings,
@@ -29,6 +23,7 @@ struct CompiledConfig {
 }
 
 /// LSP server backend.
+#[derive(Clone)]
 pub struct Backend {
     client: Client,
     /// Open documents: URI → (LSP version, full text content)
@@ -39,8 +34,8 @@ pub struct Backend {
     schema_cache: Arc<SchemaCache>,
     /// Caps concurrent spawn_blocking validations to prevent thread pool pressure
     validation_semaphore: Arc<Semaphore>,
-    /// Negotiated position encoding (set during initialize)
-    encoding: Arc<RwLock<NegotiatedEncoding>>,
+    /// True if the client negotiated UTF-8 position encoding; false = UTF-16 (default).
+    utf8_positions: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -57,7 +52,7 @@ impl Backend {
             config_cache: Arc::new(Mutex::new(HashMap::new())),
             schema_cache: Arc::new(SchemaCache::new()),
             validation_semaphore: Arc::new(Semaphore::new(8)),
-            encoding: Arc::new(RwLock::new(NegotiatedEncoding::Utf16)),
+            utf8_positions: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -78,34 +73,133 @@ impl Backend {
             }
         };
 
-        let client = self.client.clone();
-        let document_map = Arc::clone(&self.document_map);
-        let config_cache = Arc::clone(&self.config_cache);
-        let schema_cache = Arc::clone(&self.schema_cache);
-        let semaphore = Arc::clone(&self.validation_semaphore);
-        let encoding = Arc::clone(&self.encoding);
+        // Clone self cheaply (all fields are Arc).
+        let this = self.clone();
 
         // Detach the task; it runs until completion unless superseded by `spawn_version` check.
         tokio::spawn(async move {
-            validate_and_publish(
-                uri,
-                spawn_version,
-                client,
-                document_map,
-                config_cache,
-                schema_cache,
-                semaphore,
-                encoding,
-            )
-            .await;
+            this.validate_and_publish(uri, spawn_version).await;
         });
+    }
+
+    /// Debounced validation task. Sleeps 200ms, snapshots content+version atomically,
+    /// validates in `spawn_blocking`, then publishes diagnostics if the version is current.
+    ///
+    /// `spawn_version` is the document version at the time this task was spawned.
+    /// After sleeping, the task compares the current version to `spawn_version`; if they
+    /// differ, a newer edit superseded this task and it self-cancels.
+    async fn validate_and_publish(&self, uri: Uri, spawn_version: i32) {
+        // 1. Debounce: wait for typing to settle.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 2. Limit concurrent blocking validations.
+        let Ok(_permit) = self.validation_semaphore.acquire().await else {
+            return;
+        };
+
+        // 3. Snapshot content + version together in ONE lock acquisition AFTER the sleep.
+        //    This is critical — capturing content at didChange time can produce stale
+        //    content that passes the version guard (the debounce race condition).
+        let snapshot = {
+            let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
+            docs.get(&uri).map(|(v, c)| (*v, c.clone()))
+        };
+        let Some((current_version, content)) = snapshot else {
+            return; // Document was closed during the debounce window.
+        };
+
+        // 4. Check whether this task is still the right one.
+        //    If the current version doesn't match the spawn-time version, a newer
+        //    edit arrived while we were sleeping — another task handles that version.
+        if current_version != spawn_version {
+            return;
+        }
+
+        let version = current_version;
+
+        // 5. Resolve file path (non-file URIs were already filtered in did_open).
+        let Some(file_path) = uri.to_file_path().map(Cow::into_owned) else {
+            return;
+        };
+
+        // 6. All blocking I/O (config resolution + validation) in spawn_blocking.
+        let path_str = file_path.display().to_string();
+        let schema_cache_clone = Arc::clone(&self.schema_cache);
+        let config_cache_clone = Arc::clone(&self.config_cache);
+        let content_clone = content.clone();
+        let file_path_clone = file_path.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let (schema_source, config_log) =
+                resolve_schema_for_document(&file_path_clone, &config_cache_clone);
+
+            let validate_result = validate::validate_file(
+                &path_str,
+                &content_clone,
+                schema_source.as_ref(),
+                &schema_cache_clone,
+                false, // no_cache: always use disk cache in LSP mode
+                false, // strict: silent skip for files without schema
+            );
+
+            (validate_result, config_log)
+        })
+        .await;
+
+        let ((file_result, warnings, _, _), config_log) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("jvl: validation task panicked: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        // Log config errors and cache warnings to the editor output panel.
+        if let Some(msg) = config_log {
+            self.client.log_message(MessageType::WARNING, msg).await;
+        }
+        for warning in &warnings {
+            self.client
+                .log_message(MessageType::WARNING, &warning.message)
+                .await;
+        }
+
+        // 7. Post-validation version guard: discard if a newer edit arrived during validation
+        //    or the document was closed (None from the map → discard, not publish).
+        let still_current = {
+            let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
+            docs.get(&uri).map(|(v, _)| *v == version).unwrap_or(false)
+        };
+
+        if !still_current {
+            return;
+        }
+
+        // 8. Convert and publish diagnostics.
+        //    Compute line starts once for the full document, then pass to each converter.
+        let utf8 = self.utf8_positions.load(Ordering::Relaxed);
+        let line_starts = parse::compute_line_starts(&content);
+        let diagnostics: Vec<Diagnostic> = file_result
+            .errors
+            .iter()
+            .map(|d| file_diagnostic_to_lsp(d, &content, &line_starts, utf8))
+            .collect();
+
+        self.client
+            .publish_diagnostics(uri, diagnostics, None)
+            .await;
     }
 }
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Negotiate positionEncoding: prefer UTF-8 if the client advertises it.
-        let enc = params
+        let utf8 = params
             .capabilities
             .general
             .as_ref()
@@ -114,14 +208,14 @@ impl LanguageServer for Backend {
                 encs.iter()
                     .find(|e| e.as_str() == PositionEncodingKind::UTF8.as_str())
             })
-            .map(|_| NegotiatedEncoding::Utf8)
-            .unwrap_or(NegotiatedEncoding::Utf16);
+            .is_some();
 
-        *self.encoding.write().unwrap_or_else(|e| e.into_inner()) = enc;
+        self.utf8_positions.store(utf8, Ordering::Relaxed);
 
-        let position_encoding = match enc {
-            NegotiatedEncoding::Utf8 => PositionEncodingKind::UTF8,
-            NegotiatedEncoding::Utf16 => PositionEncodingKind::UTF16,
+        let position_encoding = if utf8 {
+            PositionEncodingKind::UTF8
+        } else {
+            PositionEncodingKind::UTF16
         };
 
         Ok(InitializeResult {
@@ -258,125 +352,6 @@ impl LanguageServer for Backend {
     }
 }
 
-/// Debounced validation task. Sleeps 200ms, snapshots content+version atomically,
-/// validates in `spawn_blocking`, then publishes diagnostics if the version is current.
-///
-/// `spawn_version` is the document version at the time this task was spawned.
-/// After sleeping, the task compares the current version to `spawn_version`; if they
-/// differ, a newer edit superseded this task and it self-cancels.
-#[allow(clippy::too_many_arguments)]
-async fn validate_and_publish(
-    uri: Uri,
-    spawn_version: i32,
-    client: Client,
-    document_map: Arc<Mutex<HashMap<Uri, (i32, String)>>>,
-    config_cache: Arc<Mutex<HashMap<PathBuf, Arc<CompiledConfig>>>>,
-    schema_cache: Arc<SchemaCache>,
-    semaphore: Arc<Semaphore>,
-    encoding: Arc<RwLock<NegotiatedEncoding>>,
-) {
-    // 1. Debounce: wait for typing to settle.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // 2. Limit concurrent blocking validations.
-    let Ok(_permit) = semaphore.acquire().await else {
-        return;
-    };
-
-    // 3. Snapshot content + version together in ONE lock acquisition AFTER the sleep.
-    //    This is critical — capturing content at didChange time can produce stale
-    //    content that passes the version guard (the debounce race condition).
-    let snapshot = {
-        let docs = document_map.lock().unwrap_or_else(|e| e.into_inner());
-        docs.get(&uri).map(|(v, c)| (*v, c.clone()))
-    };
-    let Some((current_version, content)) = snapshot else {
-        return; // Document was closed during the debounce window.
-    };
-
-    // 4. Check whether this task is still the right one.
-    //    If the current version doesn't match the spawn-time version, a newer
-    //    edit arrived while we were sleeping — another task handles that version.
-    if current_version != spawn_version {
-        return;
-    }
-
-    let version = current_version;
-
-    // 5. Resolve file path (non-file URIs were already filtered in did_open).
-    let Some(file_path) = uri.to_file_path().map(Cow::into_owned) else {
-        return;
-    };
-
-    // 6. All blocking I/O (config resolution + validation) in spawn_blocking.
-    let path_str = file_path.display().to_string();
-    let schema_cache_clone = Arc::clone(&schema_cache);
-    let config_cache_clone = Arc::clone(&config_cache);
-    let content_clone = content.clone();
-    let file_path_clone = file_path.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let (schema_source, config_log) =
-            resolve_schema_for_document(&file_path_clone, &config_cache_clone);
-
-        let validate_result = validate::validate_file(
-            &path_str,
-            &content_clone,
-            schema_source.as_ref(),
-            &schema_cache_clone,
-            false, // no_cache: always use disk cache in LSP mode
-            false, // strict: silent skip for files without schema
-        );
-
-        (validate_result, config_log)
-    })
-    .await;
-
-    let ((file_result, warnings, _, _), config_log) = match result {
-        Ok(r) => r,
-        Err(e) => {
-            client
-                .log_message(
-                    MessageType::ERROR,
-                    format!("jvl: validation task panicked: {e}"),
-                )
-                .await;
-            return;
-        }
-    };
-
-    // Log config errors and cache warnings to the editor output panel.
-    if let Some(msg) = config_log {
-        client.log_message(MessageType::WARNING, msg).await;
-    }
-    for warning in &warnings {
-        client
-            .log_message(MessageType::WARNING, &warning.message)
-            .await;
-    }
-
-    // 7. Post-validation version guard: discard if a newer edit arrived during validation
-    //    or the document was closed (None from the map → discard, not publish).
-    let still_current = {
-        let docs = document_map.lock().unwrap_or_else(|e| e.into_inner());
-        docs.get(&uri).map(|(v, _)| *v == version).unwrap_or(false)
-    };
-
-    if !still_current {
-        return;
-    }
-
-    // 8. Convert and publish diagnostics.
-    let enc = *encoding.read().unwrap_or_else(|e| e.into_inner());
-    let diagnostics: Vec<Diagnostic> = file_result
-        .errors
-        .iter()
-        .map(|d| file_diagnostic_to_lsp(d, &content, enc))
-        .collect();
-
-    client.publish_diagnostics(uri, diagnostics, None).await;
-}
-
 /// Resolve the schema source for a document by walking up to find jvl.json.
 ///
 /// Returns `(schema_source, optional_error_message)`.
@@ -458,42 +433,60 @@ fn resolve_schema_for_document(
 }
 
 /// Convert a byte column offset to an LSP character offset using the negotiated encoding.
-fn byte_col_to_lsp(line: &str, byte_col: usize, enc: NegotiatedEncoding) -> u32 {
+fn byte_col_to_lsp(line: &str, byte_col: usize, utf8: bool) -> u32 {
     let safe_col = byte_col.min(line.len());
-    match enc {
-        NegotiatedEncoding::Utf8 => safe_col as u32,
-        NegotiatedEncoding::Utf16 => line[..safe_col].encode_utf16().count() as u32,
+    if utf8 {
+        safe_col as u32
+    } else {
+        line[..safe_col].encode_utf16().count() as u32
     }
 }
 
 /// Convert a `FileDiagnostic` to an `lsp_types::Diagnostic`.
 ///
-/// `source` is the full document text, used for column encoding conversion.
+/// `source` is the full document text. `line_starts` is precomputed once per validation
+/// cycle and shared across all diagnostics.
 fn file_diagnostic_to_lsp(
     diag: &FileDiagnostic,
     source: &str,
-    enc: NegotiatedEncoding,
+    line_starts: &[usize],
+    utf8: bool,
 ) -> Diagnostic {
-    let line_starts = parse::compute_line_starts(source);
-
     let (start, end) = match &diag.location {
         Some(loc) => {
             // loc.line and loc.column are 1-based byte offsets.
-            let line_idx = loc.line.saturating_sub(1) as u32;
-            let line_text = source.lines().nth(line_idx as usize).unwrap_or("");
+            let line_idx = loc.line.saturating_sub(1);
+            let line_start = line_starts.get(line_idx).copied().unwrap_or(source.len());
+            let line_end = line_starts
+                .get(line_idx + 1)
+                .copied()
+                .unwrap_or(source.len());
+            let line_text = source[line_start..line_end]
+                .trim_end_matches('\n')
+                .trim_end_matches('\r');
             let byte_col = loc.column.saturating_sub(1);
-            let start_char = byte_col_to_lsp(line_text, byte_col, enc);
-            let start_pos = Position::new(line_idx, start_char);
+            let start_char = byte_col_to_lsp(line_text, byte_col, utf8);
+            let start_pos = Position::new(line_idx as u32, start_char);
 
             // End position is derived from the span's byte offset + length.
             let end_offset = loc.offset + loc.length;
             let (end_line_1based, end_col_1based) =
-                parse::offset_to_line_col(&line_starts, end_offset);
-            let end_line_idx = end_line_1based.saturating_sub(1) as u32;
-            let end_line_text = source.lines().nth(end_line_idx as usize).unwrap_or("");
+                parse::offset_to_line_col(line_starts, end_offset);
+            let end_line_idx = end_line_1based.saturating_sub(1);
+            let end_line_start = line_starts
+                .get(end_line_idx)
+                .copied()
+                .unwrap_or(source.len());
+            let end_line_end = line_starts
+                .get(end_line_idx + 1)
+                .copied()
+                .unwrap_or(source.len());
+            let end_line_text = source[end_line_start..end_line_end]
+                .trim_end_matches('\n')
+                .trim_end_matches('\r');
             let end_byte_col = end_col_1based.saturating_sub(1);
-            let end_char = byte_col_to_lsp(end_line_text, end_byte_col, enc);
-            let end_pos = Position::new(end_line_idx, end_char);
+            let end_char = byte_col_to_lsp(end_line_text, end_byte_col, utf8);
+            let end_pos = Position::new(end_line_idx as u32, end_char);
 
             (start_pos, end_pos)
         }

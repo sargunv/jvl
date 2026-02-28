@@ -290,6 +290,22 @@ fn write_cache(base: &Path, hash: &str, url: &str, content: &str) -> Result<(), 
     fs::create_dir_all(base)?;
     let schema_path = base.join(format!("{hash}.json"));
     let meta_path = base.join(format!("{hash}.meta"));
+
+    // Refuse to follow symlinks (defense-in-depth, consistent with clear_cache).
+    for path in [&schema_path, &meta_path] {
+        if let Ok(m) = fs::symlink_metadata(path)
+            && m.file_type().is_symlink()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cache file is a symlink; refusing to write: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
     fs::write(&schema_path, content)?;
     let meta = CacheMeta {
         url: url.to_string(),
