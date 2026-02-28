@@ -9,6 +9,23 @@ use thiserror::Error;
 
 use crate::diagnostic::Warning;
 
+/// Custom retriever that routes `$ref` fetches through jvl's disk cache.
+struct CachingRetriever {
+    no_cache: bool,
+}
+
+impl jsonschema::Retrieve for CachingRetriever {
+    fn retrieve(
+        &self,
+        uri: &jsonschema::Uri<String>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = uri.as_str();
+        let (content, _warnings, _outcome) = load_url_schema(url, self.no_cache)?;
+        let value: serde_json::Value = serde_json::from_str(&content)?;
+        Ok(value)
+    }
+}
+
 /// Describes how a URL schema was resolved from cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheOutcome {
@@ -330,7 +347,10 @@ impl SchemaCache {
                 }
             };
 
-            let validator = match jsonschema::validator_for(&schema_value) {
+            let validator = match jsonschema::options()
+                .with_retriever(CachingRetriever { no_cache })
+                .build(&schema_value)
+            {
                 Ok(v) => v,
                 Err(e) => {
                     return SlotResult {
