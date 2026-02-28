@@ -188,48 +188,49 @@ pub fn find_config_file(start: &Path) -> Option<PathBuf> {
 /// Returns `(files, warnings)` where warnings include any walk errors encountered.
 pub fn discover_files(
     project_root: &Path,
+    walk_roots: &[PathBuf],
     config: &Config,
 ) -> Result<(Vec<PathBuf>, Vec<Warning>), ConfigError> {
-    // Build ordered pattern list for sequential include/exclude evaluation
     let patterns = build_ordered_patterns(&config.files)?;
 
     let mut files = Vec::new();
     let mut warnings = Vec::new();
 
-    // Use ignore crate for gitignore-aware walking
-    let walker = WalkBuilder::new(project_root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
+    for walk_root in walk_roots {
+        let walker = WalkBuilder::new(walk_root)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build();
 
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                warnings.push(Warning {
-                    code: "walk".into(),
-                    message: format!("Error walking directory: {e}"),
-                });
+        for entry in walker {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warnings.push(Warning {
+                        code: "walk".into(),
+                        message: format!("Error walking directory: {e}"),
+                    });
+                    continue;
+                }
+            };
+
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
-        };
 
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
+            let path = entry.path();
+            let relative = match path.strip_prefix(project_root) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
 
-        let path = entry.path();
-        let relative = match path.strip_prefix(project_root) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+            let rel_str = relative.to_string_lossy();
 
-        let rel_str = relative.to_string_lossy();
-
-        if matches_ordered_patterns(rel_str.as_ref(), &patterns) {
-            files.push(path.to_path_buf());
+            if matches_ordered_patterns(rel_str.as_ref(), &patterns) {
+                files.push(path.to_path_buf());
+            }
         }
     }
 
