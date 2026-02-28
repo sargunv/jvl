@@ -38,6 +38,9 @@ enum Commands {
         command: CacheCommands,
     },
 
+    /// Start the Language Server Protocol server over stdio
+    Lsp,
+
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -119,6 +122,18 @@ fn main() -> ExitCode {
 
     match cli.command {
         Commands::Check(args) => run_check(args),
+        Commands::Lsp => {
+            // NOTE: tokio runtime is isolated to this subcommand to avoid making all other
+            // subcommands async and to prevent reqwest::blocking from being called outside
+            // spawn_blocking on other code paths.
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("jvl-lsp")
+                .build()
+                .expect("failed to build tokio runtime")
+                .block_on(jvl::lsp::run_server());
+            ExitCode::SUCCESS
+        }
         Commands::Config { command } => match command {
             ConfigCommands::Print(args) => run_config_print(args),
             ConfigCommands::Schema => run_config_schema(),

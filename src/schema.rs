@@ -253,14 +253,19 @@ fn is_within_ttl(meta_path: &Path) -> bool {
     }
 }
 
+static HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+fn get_http_client() -> &'static reqwest::blocking::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
+
 fn fetch_url(url: &str) -> Result<String, SchemaError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| SchemaError::FetchError {
-            url: url.to_string(),
-            reason: e.to_string(),
-        })?;
+    let client = get_http_client();
 
     let resp = client
         .get(url)

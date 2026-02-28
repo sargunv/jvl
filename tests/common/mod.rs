@@ -1,3 +1,5 @@
+pub mod lsp_client;
+
 use std::process::Command;
 
 pub fn jvl() -> Command {
