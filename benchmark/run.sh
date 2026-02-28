@@ -146,6 +146,31 @@ hyperfine \
   --command-name "yajsv" \
     "yajsv -s $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json"
 
+# ──────────────────────────────────────────────
+# Benchmark 5: package.json (draft-07 schema, 44KB schema, external $refs)
+#   ajv-cli cannot resolve external $refs, so it is excluded
+#   NOTE: jvl fetches external $refs over HTTP (issue #6), making it
+#   significantly slower here than on schemas without external $refs
+# ──────────────────────────────────────────────
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " Benchmark: package.json"
+echo " Schema: package.json (draft-07, 44KB, external \$refs)"
+echo " Config: ESLint's package.json (182 lines)"
+echo " Note: ajv-cli excluded (can't resolve external \$refs)"
+echo " Note: jvl fetches external \$refs over HTTP (see issue #6)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+hyperfine \
+  --warmup "$WARMUP" \
+  --runs "$RUNS" \
+  -N \
+  --export-markdown "$SCRIPT_DIR/results-package.md" \
+  --command-name "jvl" \
+    "$JVL check --no-cache --schema $SCHEMAS/package.schema.json $FIXTURES/package.json" \
+  --command-name "check-jsonschema" \
+    "check-jsonschema --schemafile $SCHEMAS/package.schema.json $FIXTURES/package.json" \
+  --command-name "yajsv" \
+    "yajsv -s $SCHEMAS/package.schema.json $FIXTURES/package.json"
+
 echo ""
 echo "============================================"
 echo " Benchmark complete! Results saved to:"
