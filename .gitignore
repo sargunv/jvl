@@ -1,3 +1,4 @@
 /target
 .claude/
 *.snap.new
+/benchmark/schemas/

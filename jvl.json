@@ -1,4 +1,4 @@
 {
   "$schema": "./config.schema.json",
-  "files": ["**/*.json", "**/*.jsonc", "!tests/fixtures/**"]
+  "files": ["**/*.json", "**/*.jsonc", "!tests/fixtures/**", "!benchmark/**"]
 }
