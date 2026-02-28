@@ -377,3 +377,19 @@ fn contains() {
     assert_eq!(code, 1);
     with_human_settings(|| insta::assert_snapshot!(stderr));
 }
+
+#[test]
+fn schema_load_error_points_at_schema_value() {
+    let (stderr, code) = jvl_human(&["check", &fixture("schema-load-error.json")]);
+    assert_eq!(code, 2);
+    // The underline should point at the $schema value, not at (0,0).
+    assert!(
+        stderr.contains("schema referenced here"),
+        "expected 'schema referenced here' label in stderr: {stderr}"
+    );
+    // The source header should point at line 2 (where $schema value is), not line 1 col 1.
+    assert!(
+        stderr.contains(":2:14]"),
+        "expected source location :2:14 in stderr: {stderr}"
+    );
+}

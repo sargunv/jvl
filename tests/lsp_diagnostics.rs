@@ -170,6 +170,50 @@ async fn parse_error_produces_diagnostic() {
     );
 }
 
+/// Schema load error points at the $schema value span, not (0,0).
+#[tokio::test]
+async fn schema_load_error_points_at_schema_value() {
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    let uri = doc_uri();
+    // Reference a nonexistent schema file — triggers a schema(load) error.
+    let content = r#"{"$schema": "./nonexistent-schema.json", "name": "test"}"#;
+    client.did_open(&uri, "json", 1, content).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notification = client
+        .recv_notification("textDocument/publishDiagnostics")
+        .await;
+
+    let diagnostics = notification["params"]["diagnostics"]
+        .as_array()
+        .expect("expected diagnostics array");
+    assert!(
+        !diagnostics.is_empty(),
+        "expected at least one diagnostic for schema load error"
+    );
+
+    let diag = &diagnostics[0];
+    let range = &diag["range"];
+    let start = &range["start"];
+    // The $schema value ("./nonexistent-schema.json") starts at offset 12 (line 0, char 12).
+    // It should NOT be at (0,0).
+    let start_line = start["line"].as_u64().unwrap();
+    let start_char = start["character"].as_u64().unwrap();
+    assert!(
+        start_line != 0 || start_char != 0,
+        "schema load error should not point at (0,0); got line={start_line} char={start_char}"
+    );
+    // The span should cover the value string "./nonexistent-schema.json" (with quotes).
+    let end = &range["end"];
+    let end_char = end["character"].as_u64().unwrap();
+    assert!(
+        end_char > start_char,
+        "end character should be past start character"
+    );
+}
+
 /// Non-file:// URIs are handled gracefully — no crash, and any notification received
 /// should have empty diagnostics (server skips non-file URIs).
 #[tokio::test]
