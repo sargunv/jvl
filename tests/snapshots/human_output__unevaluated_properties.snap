@@ -2,8 +2,8 @@
 source: tests/human_output.rs
 expression: stderr
 ---
-  × schema(additionalProperties): additional property 'extra' is not allowed
-   ╭─[[fixtures]/additionalProperties-invalid.json:1:19]
+  × schema(unevaluatedProperties): unevaluated property 'extra' is not allowed
+   ╭─[[fixtures]/unevaluatedProperties-invalid.json:1:19]
  1 │ { "name": "test", "extra": true }
    ·                   ───┬───
    ·                      ╰── unexpected property

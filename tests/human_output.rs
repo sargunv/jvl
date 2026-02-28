@@ -139,6 +139,42 @@ fn additional_properties() {
 }
 
 #[test]
+fn additional_properties_multiple() {
+    let (stderr, code) = jvl_human(&[
+        "check",
+        "--schema",
+        &fixture("additionalProperties-schema.json"),
+        &fixture("additionalProperties-multiple-invalid.json"),
+    ]);
+    assert_eq!(code, 1);
+    with_human_settings(|| insta::assert_snapshot!(stderr));
+}
+
+#[test]
+fn additional_items() {
+    let (stderr, code) = jvl_human(&[
+        "check",
+        "--schema",
+        &fixture("additionalItems-schema.json"),
+        &fixture("additionalItems-invalid.json"),
+    ]);
+    assert_eq!(code, 1);
+    with_human_settings(|| insta::assert_snapshot!(stderr));
+}
+
+#[test]
+fn unevaluated_properties() {
+    let (stderr, code) = jvl_human(&[
+        "check",
+        "--schema",
+        &fixture("unevaluatedProperties-schema.json"),
+        &fixture("unevaluatedProperties-invalid.json"),
+    ]);
+    assert_eq!(code, 1);
+    with_human_settings(|| insta::assert_snapshot!(stderr));
+}
+
+#[test]
 fn minimum() {
     let (stderr, code) = jvl_human(&[
         "check",

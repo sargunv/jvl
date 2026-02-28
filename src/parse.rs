@@ -31,6 +31,18 @@ impl<'a> ParsedFile<'a> {
     ) -> Option<Range<usize>> {
         resolve_pointer_in_ast(&self.ast, segments)
     }
+
+    /// Like [`resolve_pointer`], but returns the span of the **key token**
+    /// for the final `Property` segment instead of its value.
+    ///
+    /// Returns `None` if any segment cannot be resolved, if there are no
+    /// segments, or if the final segment is an array index.
+    pub fn resolve_pointer_key<'b>(
+        &self,
+        segments: impl IntoIterator<Item = LocationSegment<'b>>,
+    ) -> Option<Range<usize>> {
+        resolve_pointer_key_in_ast(&self.ast, segments)
+    }
 }
 
 /// Standard parse options: comments + trailing commas allowed.
@@ -89,6 +101,51 @@ pub fn parse_jsonc(source: &str) -> Result<ParsedFile<'_>, Vec<ParseError>> {
 pub struct ParseError {
     pub message: String,
     pub range: Option<Range<usize>>,
+}
+
+/// Walk the AST following JSON Pointer segments, returning the key span of
+/// the final `Property` segment rather than its value.
+///
+/// Returns `None` for an empty segment sequence, if any segment is
+/// unresolvable, or if the final segment is an array index.
+fn resolve_pointer_key_in_ast<'a, 'b>(
+    ast: &'a AstValue,
+    segments: impl IntoIterator<Item = LocationSegment<'b>>,
+) -> Option<Range<usize>> {
+    let mut current = ast;
+    let mut segs = segments.into_iter().peekable();
+    while let Some(seg) = segs.next() {
+        let is_last = segs.peek().is_none();
+        match seg {
+            LocationSegment::Property(name) => {
+                if let AstValue::Object(obj) = current {
+                    let prop = obj
+                        .properties
+                        .iter()
+                        .find(|p| p.name.as_str() == name.as_ref())?;
+                    if is_last {
+                        let r = prop.name.range();
+                        return Some(r.start..r.end);
+                    }
+                    current = &prop.value;
+                } else {
+                    return None;
+                }
+            }
+            LocationSegment::Index(idx) => {
+                if let AstValue::Array(arr) = current {
+                    let elem = arr.elements.get(idx)?;
+                    if is_last {
+                        return None; // array elements have no key token
+                    }
+                    current = elem;
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    None // empty segment sequence — no key to return
 }
 
 /// Walk the AST following JSON Pointer segments.

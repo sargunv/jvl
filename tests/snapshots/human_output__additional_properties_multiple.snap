@@ -1,0 +1,23 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(additionalProperties): additional property 'bar' is not allowed
+   ╭─[[fixtures]/additionalProperties-multiple-invalid.json:1:29]
+ 1 │ { "name": "test", "foo": 1, "bar": 2 }
+   ·                             ──┬──
+   ·                               ╰── unexpected property
+   ╰────
+  help: Remove the property, or check for typos in the property name.
+
+  × schema(additionalProperties): additional property 'foo' is not allowed
+   ╭─[[fixtures]/additionalProperties-multiple-invalid.json:1:19]
+ 1 │ { "name": "test", "foo": 1, "bar": 2 }
+   ·                   ──┬──
+   ·                     ╰── unexpected property
+   ╰────
+  help: Remove the property, or check for typos in the property name.
+
+
+✗ Found 2 errors in 1 file
+  Checked 1 file ([duration])

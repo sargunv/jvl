@@ -1,8 +1,10 @@
+use std::borrow::Cow;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
 use crate::diagnostic::{FileDiagnostic, FileResult, Severity, SourceLocation, Warning};
 use crate::parse::{self, ParsedFile};
 use crate::schema::{CacheOutcome, SchemaCache, SchemaError, SchemaSource};
-use std::path::Path;
-use std::time::{Duration, Instant};
 
 /// Timing breakdown for schema compilation and validation.
 #[derive(Debug, Clone, Copy)]
@@ -167,47 +169,151 @@ pub fn validate_file(
 }
 
 /// Map jsonschema validation errors to our diagnostic format.
+///
+/// Most errors produce one `FileDiagnostic`. A few produce one per offending
+/// item so each gets its own editor squiggle:
+/// - `additionalProperties` / `unevaluatedProperties`: one per extra property
+/// - `additionalItems`: one per extra array element
 fn map_validation_errors(
     parsed: &ParsedFile,
     errors: &[jsonschema::ValidationError],
 ) -> Vec<FileDiagnostic> {
-    errors
-        .iter()
-        .map(|err| {
-            let instance_path = err.instance_path();
-            let span = parsed.resolve_pointer(instance_path.iter());
+    use jsonschema::error::ValidationErrorKind;
+    use jsonschema::paths::LocationSegment;
 
-            let location = span.as_ref().map(|r| {
-                let (line, col) = parsed.offset_to_line_col(r.start);
-                SourceLocation {
-                    line,
-                    column: col,
-                    offset: r.start,
-                    length: r.len(),
+    let mut result = Vec::new();
+
+    for err in errors {
+        let schema_path = err.schema_path().as_str().to_string();
+        let base: Vec<LocationSegment<'_>> = err.instance_path().iter().collect();
+        // Re-borrow base segments so they can be chained with a new tail segment.
+        let base_iter = || {
+            base.iter().map(|s| match s {
+                LocationSegment::Property(p) => {
+                    LocationSegment::Property(Cow::Borrowed(p.as_ref()))
                 }
-            });
+                LocationSegment::Index(i) => LocationSegment::Index(*i),
+            })
+        };
 
-            let keyword = err.kind().keyword();
-            let code = format!("schema({keyword})");
-
-            let message = err.to_string();
-            let label = format_validation_label(err);
-            let help = format_validation_help(err);
-
-            let schema_path = err.schema_path().as_str().to_string();
-
-            FileDiagnostic {
-                code,
-                message,
-                severity: Severity::Error,
-                span,
-                location,
-                label: Some(label),
-                help,
-                schema_path: Some(schema_path),
+        match err.kind() {
+            // Emit one diagnostic per unexpected property so each gets its own squiggle.
+            // The squiggle lands on the property key, not the value.
+            ValidationErrorKind::AdditionalProperties { unexpected }
+            | ValidationErrorKind::UnevaluatedProperties { unexpected } => {
+                let keyword = err.kind().keyword();
+                let is_unevaluated = matches!(
+                    err.kind(),
+                    ValidationErrorKind::UnevaluatedProperties { .. }
+                );
+                let term = if is_unevaluated {
+                    "unevaluated"
+                } else {
+                    "additional"
+                };
+                for prop_name in unexpected {
+                    let span = parsed.resolve_pointer_key(base_iter().chain(std::iter::once(
+                        LocationSegment::Property(Cow::Borrowed(prop_name.as_str())),
+                    )));
+                    let location = span.as_ref().map(|r| {
+                        let (line, col) = parsed.offset_to_line_col(r.start);
+                        SourceLocation {
+                            line,
+                            column: col,
+                            offset: r.start,
+                            length: r.len(),
+                        }
+                    });
+                    result.push(FileDiagnostic {
+                        code: format!("schema({keyword})"),
+                        message: format!("{term} property '{prop_name}' is not allowed"),
+                        severity: Severity::Error,
+                        span,
+                        location,
+                        label: Some("unexpected property".into()),
+                        help: Some(
+                            "Remove the property, or check for typos in the property name.".into(),
+                        ),
+                        schema_path: Some(schema_path.clone()),
+                    });
+                }
             }
-        })
-        .collect()
+
+            // Emit one diagnostic per extra array item.
+            ValidationErrorKind::AdditionalItems { limit } => {
+                let mut any_emitted = false;
+                let mut idx = *limit;
+                loop {
+                    let span = parsed.resolve_pointer(
+                        base_iter().chain(std::iter::once(LocationSegment::Index(idx))),
+                    );
+                    let Some(span) = span else { break };
+                    let location = {
+                        let (line, col) = parsed.offset_to_line_col(span.start);
+                        Some(SourceLocation {
+                            line,
+                            column: col,
+                            offset: span.start,
+                            length: span.len(),
+                        })
+                    };
+                    result.push(FileDiagnostic {
+                        code: "schema(additionalItems)".into(),
+                        message: format!("item at index {idx} is not allowed"),
+                        severity: Severity::Error,
+                        span: Some(span),
+                        location,
+                        label: Some("extra item not allowed".into()),
+                        help: Some(
+                            "Remove the extra items, or update the schema to allow more.".into(),
+                        ),
+                        schema_path: Some(schema_path.clone()),
+                    });
+                    idx += 1;
+                    any_emitted = true;
+                }
+                // Fallback to whole-array span if no items were resolved.
+                if !any_emitted {
+                    result.push(make_diagnostic(parsed, err, &schema_path));
+                }
+            }
+
+            _ => result.push(make_diagnostic(parsed, err, &schema_path)),
+        }
+    }
+
+    result
+}
+
+/// Build a single `FileDiagnostic` from a validation error using the standard
+/// instance_path → span resolution.
+fn make_diagnostic(
+    parsed: &ParsedFile,
+    err: &jsonschema::ValidationError,
+    schema_path: &str,
+) -> FileDiagnostic {
+    let instance_path = err.instance_path();
+    let span = parsed.resolve_pointer(instance_path.iter());
+    let location = span.as_ref().map(|r| {
+        let (line, col) = parsed.offset_to_line_col(r.start);
+        SourceLocation {
+            line,
+            column: col,
+            offset: r.start,
+            length: r.len(),
+        }
+    });
+    let keyword = err.kind().keyword();
+    FileDiagnostic {
+        code: format!("schema({keyword})"),
+        message: err.to_string(),
+        severity: Severity::Error,
+        span,
+        location,
+        label: Some(format_validation_label(err)),
+        help: format_validation_help(err),
+        schema_path: Some(schema_path.to_string()),
+    }
 }
 
 /// Format a short label for the source span.
@@ -245,6 +351,9 @@ fn format_validation_label(err: &jsonschema::ValidationError) -> String {
         }
         ValidationErrorKind::MultipleOf { .. } => "value is not a valid multiple".into(),
         ValidationErrorKind::UniqueItems => "array has duplicate items".into(),
+        // These two kinds are fully handled by the special-case branches in
+        // map_validation_errors and never reach make_diagnostic. The arms are
+        // kept here only to satisfy the exhaustive match.
         ValidationErrorKind::AdditionalProperties { .. }
         | ValidationErrorKind::UnevaluatedProperties { .. } => "unexpected property".into(),
         ValidationErrorKind::AdditionalItems { .. } => "extra item not allowed".into(),
@@ -277,6 +386,7 @@ fn format_validation_help(err: &jsonschema::ValidationError) -> Option<String> {
         ValidationErrorKind::Required { .. } => {
             Some("Add the missing property to this object.".into())
         }
+        // Kept for exhaustive match; see comment in format_validation_label.
         ValidationErrorKind::AdditionalProperties { .. }
         | ValidationErrorKind::UnevaluatedProperties { .. } => {
             Some("Remove the property, or check for typos in the property name.".into())
