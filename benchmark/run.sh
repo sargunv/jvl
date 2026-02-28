@@ -7,12 +7,10 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES="$SCRIPT_DIR/fixtures"
 SCHEMAS="$SCRIPT_DIR/schemas"
 
-# Build jvl in release mode if needed
+# Build jvl in release mode
 JVL="$ROOT_DIR/target/release/jvl"
-if [[ ! -x "$JVL" ]]; then
-  echo "Building jvl (release)..."
-  cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" --quiet
-fi
+echo "Building jvl (release)..."
+cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" --quiet
 
 # Download schemas
 mkdir -p "$SCHEMAS"
@@ -68,7 +66,7 @@ hyperfine \
   -N \
   --export-markdown "$SCRIPT_DIR/results-tsconfig.md" \
   --command-name "jvl" \
-    "$JVL check --no-cache --schema $SCHEMAS/tsconfig.schema.json $FIXTURES/tsconfig.json" \
+    "$JVL check --schema $SCHEMAS/tsconfig.schema.json $FIXTURES/tsconfig.json" \
   --command-name "check-jsonschema" \
     "check-jsonschema --schemafile $SCHEMAS/tsconfig.schema.json $FIXTURES/tsconfig.json" \
   --command-name "yajsv" \
@@ -90,7 +88,7 @@ hyperfine \
   -N \
   --export-markdown "$SCRIPT_DIR/results-dprint.md" \
   --command-name "jvl" \
-    "$JVL check --no-cache --schema $SCHEMAS/dprint.schema.json $FIXTURES/dprint.json" \
+    "$JVL check --schema $SCHEMAS/dprint.schema.json $FIXTURES/dprint.json" \
   --command-name "ajv-cli" \
     "ajv validate --strict=false -s $SCHEMAS/dprint.schema.json -d $FIXTURES/dprint.json" \
   --command-name "check-jsonschema" \
@@ -114,7 +112,7 @@ hyperfine \
   -N \
   --export-markdown "$SCRIPT_DIR/results-biome.md" \
   --command-name "jvl" \
-    "$JVL check --no-cache --schema $SCHEMAS/biome.schema.json $FIXTURES/biome.json" \
+    "$JVL check --schema $SCHEMAS/biome.schema.json $FIXTURES/biome.json" \
   --command-name "ajv-cli" \
     "ajv validate --strict=false -s $SCHEMAS/biome.schema.json -d $FIXTURES/biome.json" \
   --command-name "check-jsonschema" \
@@ -138,7 +136,7 @@ hyperfine \
   -N \
   --export-markdown "$SCRIPT_DIR/results-oxlint.md" \
   --command-name "jvl" \
-    "$JVL check --no-cache --schema $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json" \
+    "$JVL check --schema $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json" \
   --command-name "ajv-cli" \
     "ajv validate --strict=false -s $SCHEMAS/oxlint.schema.json -d $FIXTURES/oxlint.json" \
   --command-name "check-jsonschema" \
@@ -149,15 +147,12 @@ hyperfine \
 # ──────────────────────────────────────────────
 # Benchmark 5: package.json (draft-07 schema, 44KB schema, external $refs)
 #   ajv-cli cannot resolve external $refs, so it is excluded
-#   NOTE: jvl fetches external $refs over HTTP (issue #6), making it
-#   significantly slower here than on schemas without external $refs
 # ──────────────────────────────────────────────
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " Benchmark: package.json"
 echo " Schema: package.json (draft-07, 44KB, external \$refs)"
 echo " Config: ESLint's package.json (182 lines)"
 echo " Note: ajv-cli excluded (can't resolve external \$refs)"
-echo " Note: jvl fetches external \$refs over HTTP (see issue #6)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 hyperfine \
   --warmup "$WARMUP" \
@@ -165,7 +160,7 @@ hyperfine \
   -N \
   --export-markdown "$SCRIPT_DIR/results-package.md" \
   --command-name "jvl" \
-    "$JVL check --no-cache --schema $SCHEMAS/package.schema.json $FIXTURES/package.json" \
+    "$JVL check --schema $SCHEMAS/package.schema.json $FIXTURES/package.json" \
   --command-name "check-jsonschema" \
     "check-jsonschema --schemafile $SCHEMAS/package.schema.json $FIXTURES/package.json" \
   --command-name "yajsv" \
