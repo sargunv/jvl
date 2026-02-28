@@ -24,7 +24,7 @@ fi
 AJV="$SCRIPT_DIR/node_modules/.bin/ajv"
 if [[ ! -x "$AJV" ]]; then
   echo "  Installing ajv-cli..."
-  npm install --prefix "$SCRIPT_DIR" ajv-cli ajv-formats --silent
+  pnpm install -C "$SCRIPT_DIR" --frozen-lockfile --silent
 fi
 
 # Install check-jsonschema

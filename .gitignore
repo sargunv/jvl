@@ -2,7 +2,5 @@
 .claude/
 *.snap.new
 /benchmark/node_modules/
-/benchmark/package.json
-/benchmark/package-lock.json
 /benchmark/yajsv
 /benchmark/schemas/

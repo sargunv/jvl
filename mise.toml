@@ -11,6 +11,8 @@ dprint = "0.51.1"
 hk = "1.36.0"
 java = "25.0.2"
 pkl = "0.30.2"
+pnpm = "10.30.2"
+node = "24.11.1"
 
 [tasks.codegen]
 run = [
