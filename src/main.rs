@@ -263,11 +263,19 @@ fn run_check(args: CheckArgs) -> ExitCode {
             );
         }
         // No explicit arguments: discover from cwd
+        let discover_start = Instant::now();
         match discover::discover_files(&project_root, std::slice::from_ref(&cwd), &config) {
             Ok((files, walk_warnings)) => {
                 early_warnings.extend(walk_warnings);
                 if verbose && args.format == Format::Human {
-                    output::verbose_log(&mut stderr, &format!("discovered {} files", files.len()));
+                    output::verbose_log(
+                        &mut stderr,
+                        &format!(
+                            "discovered {} files ({:.0?})",
+                            files.len(),
+                            discover_start.elapsed()
+                        ),
+                    );
                 }
                 files
             }
@@ -313,13 +321,18 @@ fn run_check(args: CheckArgs) -> ExitCode {
         }
 
         if !walk_roots.is_empty() {
+            let discover_start = Instant::now();
             match discover::discover_files(&project_root, &walk_roots, &config) {
                 Ok((files, walk_warnings)) => {
                     early_warnings.extend(walk_warnings);
                     if verbose && args.format == Format::Human {
                         output::verbose_log(
                             &mut stderr,
-                            &format!("discovered {} files from directories", files.len()),
+                            &format!(
+                                "discovered {} files from directories ({:.0?})",
+                                files.len(),
+                                discover_start.elapsed()
+                            ),
                         );
                     }
                     explicit_files.extend(files);
@@ -372,6 +385,10 @@ fn run_check(args: CheckArgs) -> ExitCode {
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
         .collect();
+
+    // Drop the stderr lock before entering the parallel section so that
+    // rayon worker threads can write verbose output without deadlocking.
+    drop(stderr);
 
     // Process files in parallel, collecting results via rayon's lock-free collect
     let par_results: Vec<(FileResult, Vec<Warning>, Option<VerboseFileInfo>)> = file_contents
@@ -431,6 +448,38 @@ fn run_check(args: CheckArgs) -> ExitCode {
                     (String::new(), String::new())
                 };
 
+                // Log immediately to stderr for human format (write() is atomic for <4KB)
+                if args.format == Format::Human {
+                    let status = if result.skipped {
+                        "skipped (no schema)"
+                    } else if result.valid {
+                        "valid"
+                    } else if result.tool_error {
+                        "error"
+                    } else {
+                        "invalid"
+                    };
+
+                    let schema_info = if schema_display.is_empty() && via.is_empty() {
+                        "none".to_string()
+                    } else if schema_display.is_empty() {
+                        format!("(via {via})")
+                    } else {
+                        format!("{schema_display} (via {via})")
+                    };
+
+                    let cache_info =
+                        cache_outcome.map_or(String::new(), |c| format!(" cache={}", c.as_str()));
+
+                    output::verbose_log(
+                        &mut std::io::stderr(),
+                        &format!(
+                            "{}: {status} | schema: {schema_info} | {:.0?}{cache_info}",
+                            result.path, file_duration,
+                        ),
+                    );
+                }
+
                 Some(VerboseFileInfo {
                     schema: schema_display,
                     schema_via: via,
@@ -445,42 +494,8 @@ fn run_check(args: CheckArgs) -> ExitCode {
         })
         .collect();
 
-    // Render verbose per-file messages before results
-    if verbose && args.format == Format::Human {
-        for (result, _, info) in &par_results {
-            if let Some(info) = info {
-                let status = if result.skipped {
-                    "skipped (no schema)"
-                } else if result.valid {
-                    "valid"
-                } else if result.tool_error {
-                    "error"
-                } else {
-                    "invalid"
-                };
-
-                let schema_info = if info.schema.is_empty() && info.schema_via.is_empty() {
-                    "none".to_string()
-                } else if info.schema.is_empty() {
-                    format!("(via {})", info.schema_via)
-                } else {
-                    format!("{} (via {})", info.schema, info.schema_via)
-                };
-
-                let cache_info = info
-                    .cache
-                    .map_or(String::new(), |c| format!(" cache={}", c.as_str()));
-
-                output::verbose_log(
-                    &mut stderr,
-                    &format!(
-                        "{}: {status} | schema: {schema_info} | {:.0?}{cache_info}",
-                        result.path, info.duration,
-                    ),
-                );
-            }
-        }
-    }
+    // Re-acquire stderr lock for the rest of the function.
+    let mut stderr = std::io::stderr().lock();
 
     let mut results = Vec::with_capacity(par_results.len());
     let mut verbose_file_infos: Vec<Option<VerboseFileInfo>> = Vec::new();
