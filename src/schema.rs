@@ -448,6 +448,14 @@ impl SchemaCache {
         Self::default()
     }
 
+    /// Evict a cached schema slot, forcing recompilation on the next
+    /// [`get_or_compile`](Self::get_or_compile) call for this source.
+    ///
+    /// Returns `true` if the source was present in the cache.
+    pub fn evict(&self, source: &SchemaSource) -> bool {
+        self.slots.lock().unwrap().remove(source).is_some()
+    }
+
     /// Get or load+compile a schema validator.
     ///
     /// Returns `(validator, warnings, cache_outcome)`. The validator is wrapped
@@ -538,5 +546,67 @@ impl SchemaCache {
             Ok(v) => Ok((Arc::clone(v), warnings, cache_outcome)),
             Err(e) => Err(e.clone()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn evict_forces_recompilation_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = dir.path().join("schema.json");
+
+        // Write a schema that requires {"name": string}.
+        std::fs::write(
+            &schema_path,
+            r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#,
+        )
+        .unwrap();
+
+        let cache = SchemaCache::new();
+        let source = SchemaSource::File(schema_path.clone());
+
+        // First compile should succeed and cache the validator.
+        let (validator_v1, _, _) = cache.get_or_compile(&source, true).unwrap();
+
+        // Valid doc passes.
+        let doc: serde_json::Value = serde_json::from_str(r#"{"name":"alice"}"#).unwrap();
+        assert!(validator_v1.is_valid(&doc));
+
+        // Now overwrite the schema to require {"count": number} instead.
+        let mut f = std::fs::File::create(&schema_path).unwrap();
+        f.write_all(
+            br#"{"type":"object","properties":{"count":{"type":"number"}},"required":["count"]}"#,
+        )
+        .unwrap();
+        drop(f);
+
+        // Without eviction, the cache still returns the old validator.
+        let (validator_stale, _, _) = cache.get_or_compile(&source, true).unwrap();
+        assert!(
+            validator_stale.is_valid(&doc),
+            "stale validator should still accept old doc"
+        );
+
+        // Evict and recompile — now the new schema should be used.
+        assert!(cache.evict(&source));
+        let (validator_v2, _, _) = cache.get_or_compile(&source, true).unwrap();
+
+        // Old doc is now invalid (missing "count").
+        assert!(!validator_v2.is_valid(&doc));
+
+        // New doc passes.
+        let new_doc: serde_json::Value = serde_json::from_str(r#"{"count":42}"#).unwrap();
+        assert!(validator_v2.is_valid(&new_doc));
+    }
+
+    #[test]
+    fn evict_nonexistent_returns_false() {
+        let cache = SchemaCache::new();
+        let source = SchemaSource::File(PathBuf::from("/nonexistent/schema.json"));
+        assert!(!cache.evict(&source));
     }
 }
