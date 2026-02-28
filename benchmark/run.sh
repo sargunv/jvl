@@ -165,14 +165,11 @@ echo ""
 
 # ──────────────────────────────────────────────
 # Benchmark 4: oxlint.json (draft-07 schema, 38KB schema)
-#   Uses stripped-comments version for tools that don't support JSONC
 # ──────────────────────────────────────────────
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " Benchmark: oxlint.json"
 echo " Schema: oxlintrc (draft-07, 38KB)"
-echo " Config: oxc's own oxlintrc.json (82 lines, JSONC)"
-echo " Note: ajv-cli/yajsv/check-jsonschema use"
-echo "       comment-stripped version"
+echo " Config: oxc's own oxlintrc.json (75 lines)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 hyperfine \
   --warmup "$WARMUP" \
@@ -182,11 +179,11 @@ hyperfine \
   --command-name "jvl" \
     "$JVL check --no-cache --schema $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json" \
   --command-name "ajv-cli" \
-    "$AJV validate --strict=false -s $SCHEMAS/oxlint.schema.json -d $FIXTURES/oxlint-strict.json" \
+    "$AJV validate --strict=false -s $SCHEMAS/oxlint.schema.json -d $FIXTURES/oxlint.json" \
   --command-name "check-jsonschema" \
-    "check-jsonschema --schemafile $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint-strict.json" \
+    "check-jsonschema --schemafile $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json" \
   --command-name "yajsv" \
-    "$YAJSV -s $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint-strict.json"
+    "$YAJSV -s $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json"
 
 echo ""
 echo "============================================"

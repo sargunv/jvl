@@ -28,3 +28,6 @@ run = ["hk check --all"]
 
 [tasks.fix]
 run = ["hk fix --all"]
+
+[tasks.benchmark]
+run = ["bash benchmark/run.sh"]
