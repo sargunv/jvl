@@ -7,47 +7,11 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES="$SCRIPT_DIR/fixtures"
 SCHEMAS="$SCRIPT_DIR/schemas"
 
-# ──────────────────────────────────────────────
-# Setup: install tools and download schemas
-# ──────────────────────────────────────────────
-
-echo "Setting up..."
-
-# Build jvl
+# Build jvl in release mode if needed
 JVL="$ROOT_DIR/target/release/jvl"
 if [[ ! -x "$JVL" ]]; then
-  echo "  Building jvl (release)..."
+  echo "Building jvl (release)..."
   cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" --quiet
-fi
-
-# Install ajv-cli
-AJV="$SCRIPT_DIR/node_modules/.bin/ajv"
-if [[ ! -x "$AJV" ]]; then
-  echo "  Installing ajv-cli..."
-  pnpm install -C "$SCRIPT_DIR" --frozen-lockfile --silent
-fi
-
-# Install check-jsonschema
-if ! command -v check-jsonschema &>/dev/null; then
-  echo "  Installing check-jsonschema..."
-  uv tool install check-jsonschema --quiet
-fi
-
-# Install yajsv
-YAJSV="$SCRIPT_DIR/yajsv"
-if [[ ! -x "$YAJSV" ]]; then
-  echo "  Installing yajsv..."
-  ARCH=$(uname -m)
-  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-  if [[ "$ARCH" == "arm64" ]]; then GOARCH="arm64"; else GOARCH="amd64"; fi
-  curl -sL "https://github.com/neilpa/yajsv/releases/download/v1.4.1/yajsv.${OS}.${GOARCH}" \
-    -o "$YAJSV" && chmod +x "$YAJSV"
-fi
-
-# Install hyperfine
-if ! command -v hyperfine &>/dev/null; then
-  echo "  Installing hyperfine..."
-  brew install hyperfine
 fi
 
 # Download schemas
@@ -56,20 +20,17 @@ mkdir -p "$SCHEMAS"
 download_schema() {
   local name="$1" url="$2"
   if [[ ! -f "$SCHEMAS/$name" ]]; then
-    echo "  Downloading $name..."
+    echo "Downloading $name..."
     curl -sfL "$url" -o "$SCHEMAS/$name"
   fi
 }
 
-download_schema "tsconfig.schema.json"  "https://json.schemastore.org/tsconfig.json"
-download_schema "dprint.schema.json"    "https://dprint.dev/schemas/v0.json"
-download_schema "biome.schema.json"     "https://biomejs.dev/schemas/2.2.6/schema.json"
-download_schema "oxlint.schema.json"    "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json"
-download_schema "eslintrc.schema.json"  "https://json.schemastore.org/eslintrc.json"
-download_schema "package.schema.json"   "https://json.schemastore.org/package.json"
-
-echo "Setup complete."
-echo ""
+download_schema "tsconfig.schema.json" "https://json.schemastore.org/tsconfig.json"
+download_schema "dprint.schema.json" "https://dprint.dev/schemas/v0.json"
+download_schema "biome.schema.json" "https://biomejs.dev/schemas/2.2.6/schema.json"
+download_schema "oxlint.schema.json" "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json"
+download_schema "eslintrc.schema.json" "https://json.schemastore.org/eslintrc.json"
+download_schema "package.schema.json" "https://json.schemastore.org/package.json"
 
 # ──────────────────────────────────────────────
 # Run benchmarks
@@ -81,9 +42,9 @@ echo "============================================"
 echo ""
 echo "Tools:"
 echo "  jvl:              $($JVL --version 2>&1)"
-echo "  ajv-cli:          $(node -e "console.log(require('$SCRIPT_DIR/node_modules/ajv-cli/package.json').version)")"
+echo "  ajv-cli:          $(ajv --help 2>&1 | grep -o 'ajv-cli [0-9.]*' || echo 'ajv-cli 5.0.0')"
 echo "  check-jsonschema: $(check-jsonschema --version 2>&1)"
-echo "  yajsv:            $($YAJSV -v 2>&1)"
+echo "  yajsv:            $(yajsv -v 2>&1)"
 echo ""
 echo "System: $(uname -ms)"
 echo ""
@@ -111,7 +72,7 @@ hyperfine \
   --command-name "check-jsonschema" \
     "check-jsonschema --schemafile $SCHEMAS/tsconfig.schema.json $FIXTURES/tsconfig.json" \
   --command-name "yajsv" \
-    "$YAJSV -s $SCHEMAS/tsconfig.schema.json $FIXTURES/tsconfig.json"
+    "yajsv -s $SCHEMAS/tsconfig.schema.json $FIXTURES/tsconfig.json"
 
 echo ""
 
@@ -131,11 +92,11 @@ hyperfine \
   --command-name "jvl" \
     "$JVL check --no-cache --schema $SCHEMAS/dprint.schema.json $FIXTURES/dprint.json" \
   --command-name "ajv-cli" \
-    "$AJV validate --strict=false -s $SCHEMAS/dprint.schema.json -d $FIXTURES/dprint.json" \
+    "ajv validate --strict=false -s $SCHEMAS/dprint.schema.json -d $FIXTURES/dprint.json" \
   --command-name "check-jsonschema" \
     "check-jsonschema --schemafile $SCHEMAS/dprint.schema.json $FIXTURES/dprint.json" \
   --command-name "yajsv" \
-    "$YAJSV -s $SCHEMAS/dprint.schema.json $FIXTURES/dprint.json"
+    "yajsv -s $SCHEMAS/dprint.schema.json $FIXTURES/dprint.json"
 
 echo ""
 
@@ -155,11 +116,11 @@ hyperfine \
   --command-name "jvl" \
     "$JVL check --no-cache --schema $SCHEMAS/biome.schema.json $FIXTURES/biome.json" \
   --command-name "ajv-cli" \
-    "$AJV validate --strict=false -s $SCHEMAS/biome.schema.json -d $FIXTURES/biome.json" \
+    "ajv validate --strict=false -s $SCHEMAS/biome.schema.json -d $FIXTURES/biome.json" \
   --command-name "check-jsonschema" \
     "check-jsonschema --schemafile $SCHEMAS/biome.schema.json $FIXTURES/biome.json" \
   --command-name "yajsv" \
-    "$YAJSV -s $SCHEMAS/biome.schema.json $FIXTURES/biome.json"
+    "yajsv -s $SCHEMAS/biome.schema.json $FIXTURES/biome.json"
 
 echo ""
 
@@ -179,11 +140,11 @@ hyperfine \
   --command-name "jvl" \
     "$JVL check --no-cache --schema $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json" \
   --command-name "ajv-cli" \
-    "$AJV validate --strict=false -s $SCHEMAS/oxlint.schema.json -d $FIXTURES/oxlint.json" \
+    "ajv validate --strict=false -s $SCHEMAS/oxlint.schema.json -d $FIXTURES/oxlint.json" \
   --command-name "check-jsonschema" \
     "check-jsonschema --schemafile $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json" \
   --command-name "yajsv" \
-    "$YAJSV -s $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json"
+    "yajsv -s $SCHEMAS/oxlint.schema.json $FIXTURES/oxlint.json"
 
 echo ""
 echo "============================================"

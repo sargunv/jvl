@@ -1,6 +1,4 @@
 /target
 .claude/
 *.snap.new
-/benchmark/node_modules/
-/benchmark/yajsv
 /benchmark/schemas/
