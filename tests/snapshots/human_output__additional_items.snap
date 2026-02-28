@@ -1,0 +1,23 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(additionalItems): item at index 2 is not allowed
+   ╭─[[fixtures]/additionalItems-invalid.json:1:15]
+ 1 │ ["hello", 42, "extra", true]
+   ·               ───┬───
+   ·                  ╰── extra item not allowed
+   ╰────
+  help: Remove the extra items, or update the schema to allow more.
+
+  × schema(additionalItems): item at index 3 is not allowed
+   ╭─[[fixtures]/additionalItems-invalid.json:1:24]
+ 1 │ ["hello", 42, "extra", true]
+   ·                        ──┬─
+   ·                          ╰── extra item not allowed
+   ╰────
+  help: Remove the extra items, or update the schema to allow more.
+
+
+✗ Found 2 errors in 1 file
+  Checked 1 file ([duration])
