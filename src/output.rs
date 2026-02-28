@@ -1,4 +1,5 @@
 use crate::diagnostic::{FileResult, Severity, ToolDiagnostic, Warning};
+use crate::schema::CacheOutcome;
 use owo_colors::Stream::Stderr;
 use owo_colors::{OwoColorize, Style};
 use serde::Serialize;
@@ -26,6 +27,18 @@ pub enum Format {
     Json,
 }
 
+/// Per-file verbose diagnostic info collected during processing.
+pub struct VerboseFileInfo {
+    /// Display string for the resolved schema (URL or path), empty if none.
+    pub schema: String,
+    /// How the schema was resolved: "flag", "config", "inline $schema", or empty.
+    pub schema_via: String,
+    /// Disk-cache outcome for URL schemas, `None` for file schemas or in-memory hits.
+    pub cache: Option<CacheOutcome>,
+    /// Time spent validating this file.
+    pub duration: Duration,
+}
+
 fn plural(n: usize, singular: &str, plural_form: &str) -> String {
     if n == 1 {
         format!("{n} {singular}")
@@ -46,6 +59,16 @@ fn format_duration(d: Duration) -> String {
             format!("{}s", secs.round() as u64)
         }
     }
+}
+
+/// Write a verbose diagnostic message to stderr with dimmed styling.
+pub fn verbose_log(stderr: &mut impl Write, msg: &str) {
+    let line = format!("[verbose] {msg}");
+    let _ = writeln!(
+        stderr,
+        "{}",
+        line.if_supports_color(Stderr, |text| text.dimmed())
+    );
 }
 
 /// Render results in human format using miette.
@@ -157,6 +180,14 @@ struct JsonOutput<'a> {
 struct JsonFileResult {
     path: String,
     valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_via: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
     errors: Vec<JsonError>,
 }
 
@@ -191,13 +222,17 @@ struct JsonSummary {
 }
 
 /// Render results in JSON format.
+///
+/// When `verbose_infos` is `Some`, per-file diagnostic fields (schema, cache,
+/// duration) are included in the JSON output for agent/script consumption.
 pub fn render_json(
     results: &[FileResult],
     warnings: &[Warning],
     summary: &Summary,
+    verbose_infos: Option<&[Option<VerboseFileInfo>]>,
     stdout: &mut impl Write,
 ) {
-    let json_output = build_json_output(results, warnings, summary);
+    let json_output = build_json_output(results, warnings, summary, verbose_infos);
     let json_str = serde_json::to_string_pretty(&json_output).unwrap();
     let _ = writeln!(stdout, "{json_str}");
 }
@@ -206,11 +241,13 @@ fn build_json_output<'a>(
     results: &[FileResult],
     warnings: &'a [Warning],
     summary: &Summary,
+    verbose_infos: Option<&[Option<VerboseFileInfo>]>,
 ) -> JsonOutput<'a> {
     let files: Vec<JsonFileResult> = results
         .iter()
-        .filter(|r| !r.skipped)
-        .map(|r| {
+        .enumerate()
+        .filter(|(_, r)| !r.skipped)
+        .map(|(i, r)| {
             let errors: Vec<JsonError> = r
                 .errors
                 .iter()
@@ -232,9 +269,34 @@ fn build_json_output<'a>(
                 })
                 .collect();
 
+            let (schema, schema_via, cache, duration_ms) = if let Some(infos) = verbose_infos
+                && let Some(Some(info)) = infos.get(i)
+            {
+                let schema = if info.schema.is_empty() {
+                    None
+                } else {
+                    Some(info.schema.clone())
+                };
+                let schema_via = if info.schema_via.is_empty() {
+                    None
+                } else {
+                    Some(info.schema_via.clone())
+                };
+                let cache = info.cache.map(|c| c.as_str().to_string());
+                let duration_ms =
+                    Some(u64::try_from(info.duration.as_millis()).unwrap_or(u64::MAX));
+                (schema, schema_via, cache, duration_ms)
+            } else {
+                (None, None, None, None)
+            };
+
             JsonFileResult {
                 path: r.path.clone(),
                 valid: r.valid,
+                schema,
+                schema_via,
+                cache,
+                duration_ms,
                 errors,
             }
         })

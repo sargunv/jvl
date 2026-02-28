@@ -1,11 +1,13 @@
 use crate::diagnostic::{FileDiagnostic, FileResult, Severity, SourceLocation, Warning};
 use crate::parse::{self, ParsedFile};
-use crate::schema::{SchemaCache, SchemaError, SchemaSource};
+use crate::schema::{CacheOutcome, SchemaCache, SchemaError, SchemaSource};
 use std::path::Path;
 
 /// Validate a single file against a resolved schema.
 ///
-/// Returns the file result and any warnings generated during validation.
+/// Returns `(file_result, warnings, cache_outcome)`. The `cache_outcome` is
+/// `None` for file-based schemas, skipped files, or when the compiled schema
+/// was already cached in memory by another thread.
 pub fn validate_file(
     file_path: &str,
     source: &str,
@@ -13,7 +15,7 @@ pub fn validate_file(
     schema_cache: &SchemaCache,
     no_cache: bool,
     strict: bool,
-) -> (FileResult, Vec<Warning>) {
+) -> (FileResult, Vec<Warning>, Option<CacheOutcome>) {
     let mut warnings = Vec::new();
 
     // Parse the file
@@ -45,7 +47,7 @@ pub fn validate_file(
                     }
                 })
                 .collect();
-            return (FileResult::invalid(file_path, errors), warnings);
+            return (FileResult::invalid(file_path, errors), warnings, None);
         }
     };
 
@@ -80,13 +82,14 @@ pub fn validate_file(
                     }],
                 ),
                 warnings,
+                None,
             );
         }
-        return (FileResult::skipped(file_path), warnings);
+        return (FileResult::skipped(file_path), warnings, None);
     };
 
     // Load schema and get/compile the validator
-    let (validator, schema_warnings) =
+    let (validator, schema_warnings, cache_outcome) =
         match schema_cache.get_or_compile(&effective_schema, no_cache) {
             Ok(result) => result,
             Err(e) => {
@@ -109,6 +112,7 @@ pub fn validate_file(
                         }],
                     ),
                     warnings,
+                    None,
                 );
             }
         };
@@ -118,11 +122,15 @@ pub fn validate_file(
     let validation_errors: Vec<_> = validator.iter_errors(&parsed.value).collect();
 
     if validation_errors.is_empty() {
-        return (FileResult::valid(file_path), warnings);
+        return (FileResult::valid(file_path), warnings, cache_outcome);
     }
 
     let errors = map_validation_errors(&parsed, &validation_errors);
-    (FileResult::invalid(file_path, errors), warnings)
+    (
+        FileResult::invalid(file_path, errors),
+        warnings,
+        cache_outcome,
+    )
 }
 
 /// Map jsonschema validation errors to our diagnostic format.
