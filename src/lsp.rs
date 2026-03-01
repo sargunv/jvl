@@ -70,6 +70,11 @@ pub struct Backend {
     next_reg_id: Arc<AtomicU64>,
     /// True if the client supports Markdown in hover content.
     hover_markdown: Arc<AtomicBool>,
+    /// True if the client supports snippet syntax in completion insertText.
+    snippet_support: Arc<AtomicBool>,
+    /// Last successfully parsed `serde_json::Value` per document URI.
+    /// Used as a fallback when the current document text is malformed.
+    last_good_value: Arc<Mutex<HashMap<Uri, Arc<serde_json::Value>>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -90,6 +95,8 @@ impl Backend {
             watched_schema_paths: Arc::new(Mutex::new(HashSet::new())),
             next_reg_id: Arc::new(AtomicU64::new(0)),
             hover_markdown: Arc::new(AtomicBool::new(true)),
+            snippet_support: Arc::new(AtomicBool::new(false)),
+            last_good_value: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -167,6 +174,11 @@ impl Backend {
         let file_path_clone = file_path.clone();
 
         let result = tokio::task::spawn_blocking(move || {
+            // Try to parse for the stale value cache (cheap relative to validation).
+            let parsed_value = parse::parse_jsonc(&content_clone)
+                .ok()
+                .map(|p| Arc::new(p.value));
+
             let resolved = resolve_schema_for_document(&file_path_clone, &config_cache_clone);
 
             let validate_result = validate::validate_file(
@@ -178,11 +190,11 @@ impl Backend {
                 resolved.strict,
             );
 
-            (validate_result, resolved.config_log)
+            (validate_result, resolved.config_log, parsed_value)
         })
         .await;
 
-        let ((file_result, warnings, _, _), config_log) = match result {
+        let ((file_result, warnings, _, _), config_log, parsed_value) = match result {
             Ok(r) => r,
             Err(e) => {
                 self.client
@@ -216,7 +228,15 @@ impl Backend {
             return;
         }
 
-        // 8. Convert and publish diagnostics.
+        // 8. Update stale value cache if the parse succeeded.
+        if let Some(value) = parsed_value {
+            self.last_good_value
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(uri.clone(), value);
+        }
+
+        // 9. Convert and publish diagnostics.
         //    Compute line starts once for the full document, then pass to each converter.
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
         let line_starts = parse::compute_line_starts(&content);
@@ -232,6 +252,36 @@ impl Backend {
 
         // Register file watchers for any newly discovered schema files.
         self.update_schema_watchers().await;
+    }
+
+    /// Snapshot the current document text for the given URI.
+    fn snapshot_document(&self, uri: &Uri) -> Option<Arc<String>> {
+        let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
+        docs.get(uri).map(|(_, c)| c.clone())
+    }
+
+    /// Resolve the schema source for a document URI, compile it, and return
+    /// the raw schema `serde_json::Value`. Returns `None` if the URI is not a
+    /// file:// URI, no schema is configured, or the schema fails to compile.
+    fn resolve_schema_value(
+        &self,
+        uri: &Uri,
+        parsed_value: &serde_json::Value,
+    ) -> Option<Arc<serde_json::Value>> {
+        let file_path = uri.to_file_path().map(Cow::into_owned)?;
+        let resolved = resolve_schema_for_document(&file_path, &self.config_cache);
+
+        let schema_source = resolved
+            .schema_source
+            .or_else(|| schema::resolve_schema_from_value(parsed_value, &file_path))?;
+
+        match self
+            .schema_cache
+            .get_or_compile_with_value(&schema_source, false)
+        {
+            Ok(Some(v)) => Some(v),
+            _ => None,
+        }
     }
 
     /// Register file watchers for newly discovered schema file paths.
@@ -311,6 +361,15 @@ impl LanguageServer for Backend {
                 .store(formats.contains(&MarkupKind::Markdown), Ordering::Relaxed);
         }
 
+        // Check if client supports snippet syntax in completion insertText.
+        if let Some(text_doc) = &params.capabilities.text_document
+            && let Some(completion_caps) = &text_doc.completion
+            && let Some(item_caps) = &completion_caps.completion_item
+            && item_caps.snippet_support == Some(true)
+        {
+            self.snippet_support.store(true, Ordering::Relaxed);
+        }
+
         let position_encoding = if utf8 {
             PositionEncodingKind::UTF8
         } else {
@@ -328,6 +387,11 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec!["\"".to_string()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         })
@@ -417,6 +481,12 @@ impl LanguageServer for Backend {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&uri);
 
+        // Remove from stale value cache.
+        self.last_good_value
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
+
         // Clear diagnostics for this document.
         self.client.publish_diagnostics(uri, vec![], None).await;
     }
@@ -425,12 +495,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // 1. Snapshot document text from document_map.
-        let content = {
-            let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.get(&uri).map(|(_, c)| c.clone())
-        };
-        let Some(content) = content else {
+        // 1. Snapshot document text.
+        let Some(content) = self.snapshot_document(&uri) else {
             return Ok(None);
         };
 
@@ -443,54 +509,27 @@ impl LanguageServer for Backend {
         // 3. Convert LSP position to byte offset.
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
         let line_starts = parse::compute_line_starts(&content);
-        let line_idx = position.line as usize;
-        let line_start = match line_starts.get(line_idx) {
-            Some(&start) => start,
-            None => return Ok(None),
+        let Some(byte_offset) = lsp_position_to_byte_offset(&content, &line_starts, position, utf8)
+        else {
+            return Ok(None);
         };
-        let line_end = line_starts
-            .get(line_idx + 1)
-            .copied()
-            .unwrap_or(content.len());
-        let line_text = &content[line_start..line_end];
-        let byte_col = lsp_col_to_byte(line_text, position.character, utf8);
-        let byte_offset = line_start + byte_col;
 
         // 4. Find JSON pointer at byte offset.
         let Some((pointer, node_range)) = parse::offset_to_pointer(&parsed.ast, byte_offset) else {
             return Ok(None);
         };
 
-        // 5. Resolve schema source for this document.
-        let Some(file_path) = uri.to_file_path().map(Cow::into_owned) else {
+        // 5. Resolve schema value for this document.
+        let Some(schema_value) = self.resolve_schema_value(&uri, &parsed.value) else {
             return Ok(None);
         };
-        let resolved = resolve_schema_for_document(&file_path, &self.config_cache);
 
-        // If no schema source from config, try the $schema field in the document itself.
-        let schema_source = match resolved
-            .schema_source
-            .or_else(|| schema::resolve_schema_from_value(&parsed.value, &file_path))
-        {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        // 6. Ensure schema is compiled and get the raw schema value.
-        let schema_value = match self
-            .schema_cache
-            .get_or_compile_with_value(&schema_source, false)
-        {
-            Ok(Some(v)) => v,
-            _ => return Ok(None),
-        };
-
-        // 7. Look up hover content from schema annotations.
+        // 6. Look up hover content from schema annotations.
         let Some(hover_content) = schema::lookup_hover_content(&schema_value, &pointer) else {
             return Ok(None);
         };
 
-        // 8. Convert node_range back to LSP Range.
+        // 7. Convert node_range back to LSP Range.
         let start_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.start, utf8);
         let end_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.end, utf8);
 
@@ -507,6 +546,75 @@ impl LanguageServer for Backend {
             }),
             range: Some(Range::new(start_pos, end_pos)),
         }))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        // 1. Snapshot document text.
+        let Some(content) = self.snapshot_document(&uri) else {
+            return Ok(None);
+        };
+
+        // 2. Try parsing current text; fall back to stale cached value.
+        let parsed_value = match parse::parse_jsonc(&content) {
+            Ok(p) => Arc::new(p.value),
+            Err(_) => {
+                let stale = self
+                    .last_good_value
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&uri)
+                    .cloned();
+                match stale {
+                    Some(v) => v,
+                    None => return Ok(None),
+                }
+            }
+        };
+
+        // 3. Convert LSP position to byte offset.
+        let utf8 = self.utf8_positions.load(Ordering::Relaxed);
+        let line_starts = parse::compute_line_starts(&content);
+        let Some(byte_offset) = lsp_position_to_byte_offset(&content, &line_starts, position, utf8)
+        else {
+            return Ok(None);
+        };
+
+        // 4. Determine completion context via text scanning.
+        let Some(ctx) = parse::completion_context(&content, byte_offset) else {
+            return Ok(None);
+        };
+
+        // 5. Resolve schema value for this document.
+        let Some(schema_value) = self.resolve_schema_value(&uri, &parsed_value) else {
+            return Ok(None);
+        };
+
+        // 6. Build completion items based on context.
+        let snippet = self.snippet_support.load(Ordering::Relaxed);
+        let markdown = self.hover_markdown.load(Ordering::Relaxed);
+
+        let items = match &ctx {
+            parse::CompletionContext::PropertyKey { pointer } => {
+                let props = schema::collect_properties(&schema_value, pointer);
+                let existing = existing_keys(&parsed_value, pointer);
+                build_property_items(&props, &existing, snippet, markdown)
+            }
+            parse::CompletionContext::PropertyValue {
+                property_name,
+                pointer,
+            } => {
+                let values = schema::collect_values(&schema_value, pointer, property_name);
+                build_value_items(&values)
+            }
+        };
+
+        Ok(Some(CompletionResponse::List(CompletionList {
+            is_incomplete: false,
+            items,
+        })))
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -666,6 +774,26 @@ fn resolve_schema_for_document(
     }
 }
 
+/// Convert an LSP `Position` to a byte offset in `source`.
+///
+/// Returns `None` if the line index is out of range.
+fn lsp_position_to_byte_offset(
+    source: &str,
+    line_starts: &[usize],
+    position: Position,
+    utf8: bool,
+) -> Option<usize> {
+    let line_idx = position.line as usize;
+    let line_start = *line_starts.get(line_idx)?;
+    let line_end = line_starts
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(source.len());
+    let line_text = &source[line_start..line_end];
+    let byte_col = lsp_col_to_byte(line_text, position.character, utf8);
+    Some(line_start + byte_col)
+}
+
 /// Convert a byte offset in `source` to an LSP `Position`.
 ///
 /// Uses `offset_to_line_col` to find the 1-based line/column, then converts
@@ -781,6 +909,169 @@ fn escape_glob_metacharacters(s: &str) -> String {
         escaped.push(c);
     }
     escaped
+}
+
+/// Escape LSP snippet metacharacters (`$`, `}`, `\`) in a string so it is
+/// treated as literal text inside an `InsertTextFormat::Snippet`.
+fn escape_snippet(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('$', "\\$")
+        .replace('}', "\\}")
+}
+
+/// Collect existing property keys from a `serde_json::Value` at a given pointer path.
+fn existing_keys(value: &serde_json::Value, pointer: &[String]) -> HashSet<String> {
+    let mut current = value;
+    for segment in pointer {
+        current = match current.get(segment.as_str()) {
+            Some(v) => v,
+            None => return HashSet::new(),
+        };
+    }
+    current
+        .as_object()
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Build `CompletionItem` list from schema property info.
+fn build_property_items(
+    props: &[schema::PropertyInfo],
+    existing: &HashSet<String>,
+    snippet: bool,
+    markdown: bool,
+) -> Vec<CompletionItem> {
+    props
+        .iter()
+        .filter(|p| !existing.contains(&p.name))
+        .map(|p| {
+            let detail = {
+                let type_str = p.schema_type.as_deref().unwrap_or("any");
+                if p.required {
+                    Some(format!("{type_str} (required)"))
+                } else {
+                    Some(type_str.to_string())
+                }
+            };
+
+            let documentation = p.description.as_ref().map(|d| {
+                let kind = if markdown {
+                    MarkupKind::Markdown
+                } else {
+                    MarkupKind::PlainText
+                };
+                Documentation::MarkupContent(MarkupContent {
+                    kind,
+                    value: d.clone(),
+                })
+            });
+
+            let sort_text = if p.required {
+                Some(format!("0_{}", p.name))
+            } else {
+                Some(format!("1_{}", p.name))
+            };
+
+            let (insert_text, insert_text_format) = if snippet {
+                let value_snippet = snippet_for_type(p.schema_type.as_deref());
+                (
+                    Some(format!(
+                        "\"{}\": {}",
+                        escape_snippet(&p.name),
+                        value_snippet
+                    )),
+                    Some(InsertTextFormat::SNIPPET),
+                )
+            } else {
+                (
+                    Some(format!("\"{}\": ", p.name)),
+                    Some(InsertTextFormat::PLAIN_TEXT),
+                )
+            };
+
+            // `filter_text` lets the client match against the bare property name
+            // even though `insert_text` contains quotes and the value placeholder.
+            let filter_text = Some(p.name.clone());
+
+            CompletionItem {
+                label: p.name.clone(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail,
+                documentation,
+                sort_text,
+                filter_text,
+                insert_text,
+                insert_text_format,
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Build `CompletionItem` list from schema value suggestions.
+fn build_value_items(values: &[schema::ValueSuggestion]) -> Vec<CompletionItem> {
+    values
+        .iter()
+        .flat_map(|v| match v {
+            schema::ValueSuggestion::Enum(val) => {
+                let formatted = format_json_value(val);
+                vec![CompletionItem {
+                    insert_text: Some(formatted.clone()),
+                    label: formatted,
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    ..Default::default()
+                }]
+            }
+            schema::ValueSuggestion::Const(val) => {
+                let formatted = format_json_value(val);
+                vec![CompletionItem {
+                    insert_text: Some(formatted.clone()),
+                    label: formatted,
+                    kind: Some(CompletionItemKind::VALUE),
+                    ..Default::default()
+                }]
+            }
+            schema::ValueSuggestion::Boolean => {
+                vec![
+                    CompletionItem {
+                        label: "true".to_string(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        ..Default::default()
+                    },
+                    CompletionItem {
+                        label: "false".to_string(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        ..Default::default()
+                    },
+                ]
+            }
+            schema::ValueSuggestion::Null => {
+                vec![CompletionItem {
+                    label: "null".to_string(),
+                    kind: Some(CompletionItemKind::VALUE),
+                    ..Default::default()
+                }]
+            }
+        })
+        .collect()
+}
+
+/// Format a serde_json::Value as a JSON string suitable for insertion.
+fn format_json_value(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+/// Return a snippet placeholder appropriate for the given JSON schema type.
+fn snippet_for_type(schema_type: Option<&str>) -> &'static str {
+    match schema_type {
+        Some("string") => "\"$1\"",
+        Some("number") | Some("integer") => "${1:0}",
+        Some("boolean") => "${1:false}",
+        Some("object") => "{$1}",
+        Some("array") => "[$1]",
+        Some("null") => "null",
+        _ => "$0",
+    }
 }
 
 /// Start the LSP server over stdio.
