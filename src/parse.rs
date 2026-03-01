@@ -201,6 +201,62 @@ pub fn offset_to_line_col(line_starts: &[usize], offset: usize) -> (usize, usize
     (line + 1, col + 1)
 }
 
+/// Find the JSON pointer path for the node at a given byte offset.
+///
+/// Walks the AST to find which key or value contains `offset`. Returns the JSON
+/// pointer path as a list of segments and the byte range of the hit node (for
+/// hover highlighting). Returns `None` if the offset falls on structural tokens,
+/// whitespace, or outside the AST.
+pub fn offset_to_pointer(ast: &AstValue, offset: usize) -> Option<(Vec<String>, Range<usize>)> {
+    let r = ast.range();
+    if offset < r.start || offset >= r.end {
+        return None;
+    }
+    let mut path: Vec<String> = Vec::new();
+    offset_to_pointer_walk(ast, offset, &mut path)
+}
+
+fn offset_to_pointer_walk(
+    node: &AstValue,
+    offset: usize,
+    path: &mut Vec<String>,
+) -> Option<(Vec<String>, Range<usize>)> {
+    match node {
+        AstValue::Object(obj) => {
+            for prop in &obj.properties {
+                // Check if offset is on the key.
+                let key_range = prop.name.range();
+                if offset >= key_range.start && offset < key_range.end {
+                    path.push(prop.name.as_str().to_string());
+                    return Some((path.clone(), key_range.start..key_range.end));
+                }
+                // Check if offset is on the value.
+                let val_range = prop.value.range();
+                if offset >= val_range.start && offset < val_range.end {
+                    path.push(prop.name.as_str().to_string());
+                    return offset_to_pointer_walk(&prop.value, offset, path);
+                }
+            }
+            None // offset is on structural tokens ({, }, :, ,) or whitespace
+        }
+        AstValue::Array(arr) => {
+            for (idx, elem) in arr.elements.iter().enumerate() {
+                let elem_range = elem.range();
+                if offset >= elem_range.start && offset < elem_range.end {
+                    path.push(idx.to_string());
+                    return offset_to_pointer_walk(elem, offset, path);
+                }
+            }
+            None
+        }
+        // Leaf nodes: the offset is within this scalar value.
+        _ => {
+            let r = node.range();
+            Some((path.clone(), r.start..r.end))
+        }
+    }
+}
+
 /// Extract the `$schema` field from a parsed JSON value.
 pub fn extract_schema_field(value: &serde_json::Value) -> Option<&str> {
     value
@@ -259,5 +315,70 @@ mod tests {
     fn test_extract_schema_field_missing() {
         let v: serde_json::Value = serde_json::json!({"key": "val"});
         assert_eq!(extract_schema_field(&v), None);
+    }
+
+    #[test]
+    fn test_offset_to_pointer_on_key() {
+        // {"name": "value"}
+        let source = r#"{"name": "value"}"#;
+        let parsed = parse_jsonc(source).unwrap();
+        // "name" starts at byte 1 (the opening quote)
+        let result = offset_to_pointer(&parsed.ast, 1);
+        assert!(result.is_some());
+        let (pointer, _range) = result.unwrap();
+        assert_eq!(pointer, vec!["name"]);
+    }
+
+    #[test]
+    fn test_offset_to_pointer_on_value() {
+        let source = r#"{"name": "value"}"#;
+        let parsed = parse_jsonc(source).unwrap();
+        // "value" starts at byte 9 (the opening quote of the value)
+        let result = offset_to_pointer(&parsed.ast, 9);
+        assert!(result.is_some());
+        let (pointer, _range) = result.unwrap();
+        assert_eq!(pointer, vec!["name"]);
+    }
+
+    #[test]
+    fn test_offset_to_pointer_nested() {
+        let source = r#"{"a": {"b": 42}}"#;
+        let parsed = parse_jsonc(source).unwrap();
+        // 42 is the value at pointer ["a", "b"]
+        // Find offset of "42" in the source
+        let offset = source.find("42").unwrap();
+        let result = offset_to_pointer(&parsed.ast, offset);
+        assert!(result.is_some());
+        let (pointer, _range) = result.unwrap();
+        assert_eq!(pointer, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_offset_to_pointer_on_structural_token() {
+        let source = r#"{"name": "value"}"#;
+        let parsed = parse_jsonc(source).unwrap();
+        // Offset 0 is the opening brace `{`
+        let result = offset_to_pointer(&parsed.ast, 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_offset_to_pointer_array_element() {
+        let source = r#"{"items": [1, 2, 3]}"#;
+        let parsed = parse_jsonc(source).unwrap();
+        // Find offset of "2" in the source
+        let offset = source.find(", 2").unwrap() + 2;
+        let result = offset_to_pointer(&parsed.ast, offset);
+        assert!(result.is_some());
+        let (pointer, _range) = result.unwrap();
+        assert_eq!(pointer, vec!["items", "1"]);
+    }
+
+    #[test]
+    fn test_offset_to_pointer_out_of_range() {
+        let source = r#"{"key": "val"}"#;
+        let parsed = parse_jsonc(source).unwrap();
+        let result = offset_to_pointer(&parsed.ast, 999);
+        assert!(result.is_none());
     }
 }
