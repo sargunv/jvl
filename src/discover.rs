@@ -64,6 +64,11 @@ pub struct Config {
     /// path) with a set of file glob patterns.
     #[serde(default)]
     pub schemas: Vec<SchemaMapping>,
+
+    /// When true, files with no resolvable schema produce an error diagnostic
+    /// instead of being silently skipped.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 fn default_files() -> Vec<String> {
@@ -159,6 +164,7 @@ impl Config {
             schema_url: None,
             files: default_files(),
             schemas: vec![],
+            strict: false,
         }
     }
 }
@@ -191,7 +197,7 @@ pub fn discover_files(
     walk_roots: &[PathBuf],
     config: &Config,
 ) -> Result<(Vec<PathBuf>, Vec<Warning>), ConfigError> {
-    let patterns = build_ordered_patterns(&config.files)?;
+    let file_filter = CompiledFileFilter::compile(config)?;
 
     let mut files = Vec::new();
     let mut warnings = Vec::new();
@@ -228,7 +234,7 @@ pub fn discover_files(
 
             let rel_str = relative.to_string_lossy();
 
-            if matches_ordered_patterns(rel_str.as_ref(), &patterns) {
+            if file_filter.matches(rel_str.as_ref()) {
                 files.push(path.to_path_buf());
             }
         }
@@ -330,4 +336,25 @@ fn matches_ordered_patterns(path: &str, patterns: &[PatternEntry]) -> bool {
         }
     }
     matched
+}
+
+/// Pre-compiled file patterns for efficient per-file matching.
+///
+/// Wraps the ordered include/exclude pattern list behind a clean API,
+/// mirroring the encapsulation pattern of [`CompiledSchemaMappings`].
+pub struct CompiledFileFilter {
+    patterns: Vec<PatternEntry>,
+}
+
+impl CompiledFileFilter {
+    /// Compile the `files` patterns from a config.
+    pub fn compile(config: &Config) -> Result<Self, ConfigError> {
+        let patterns = build_ordered_patterns(&config.files)?;
+        Ok(Self { patterns })
+    }
+
+    /// Returns true if the relative path matches the file patterns.
+    pub fn matches(&self, relative_path: &str) -> bool {
+        matches_ordered_patterns(relative_path, &self.patterns)
+    }
 }

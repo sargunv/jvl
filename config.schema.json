@@ -71,6 +71,11 @@
       "description": "Schema mappings. Each entry associates a schema source (URL or local path) with a set of file glob patterns.",
       "items": { "$ref": "#/$defs/SchemaMapping" },
       "type": "array"
+    },
+    "strict": {
+      "default": false,
+      "description": "When true, files with no resolvable schema produce an error diagnostic instead of being silently skipped.",
+      "type": "boolean"
     }
   },
   "title": "jvl configuration",
