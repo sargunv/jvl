@@ -49,13 +49,23 @@ impl ResolvedDocument {
     }
 }
 
+/// Per-document state tracked by the LSP backend.
+struct DocumentState {
+    /// LSP document version number.
+    version: i32,
+    /// Full text content of the open document.
+    content: Arc<String>,
+    /// Last successfully parsed `serde_json::Value`.
+    /// Used as a fallback when the current document text is malformed.
+    last_good_value: Option<Arc<serde_json::Value>>,
+}
+
 /// LSP server backend.
 #[derive(Clone)]
 pub struct Backend {
     client: Client,
-    /// Open documents: URI → (LSP version, full text content)
-    #[allow(clippy::type_complexity)]
-    document_map: Arc<Mutex<HashMap<Uri, (i32, Arc<String>)>>>,
+    /// Open documents: URI → per-document state.
+    documents: Arc<Mutex<HashMap<Uri, DocumentState>>>,
     /// jvl.json config cache: config file path → compiled config
     config_cache: Arc<Mutex<HashMap<PathBuf, Arc<CompiledConfig>>>>,
     /// Compiled JSON Schema validator cache (shared with validate_file)
@@ -72,9 +82,6 @@ pub struct Backend {
     hover_markdown: Arc<AtomicBool>,
     /// True if the client supports snippet syntax in completion insertText.
     snippet_support: Arc<AtomicBool>,
-    /// Last successfully parsed `serde_json::Value` per document URI.
-    /// Used as a fallback when the current document text is malformed.
-    last_good_value: Arc<Mutex<HashMap<Uri, Arc<serde_json::Value>>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -87,7 +94,7 @@ impl Backend {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            document_map: Arc::new(Mutex::new(HashMap::new())),
+            documents: Arc::new(Mutex::new(HashMap::new())),
             config_cache: Arc::new(Mutex::new(HashMap::new())),
             schema_cache: Arc::new(SchemaCache::new()),
             validation_semaphore: Arc::new(Semaphore::new(8)),
@@ -96,7 +103,6 @@ impl Backend {
             next_reg_id: Arc::new(AtomicU64::new(0)),
             hover_markdown: Arc::new(AtomicBool::new(true)),
             snippet_support: Arc::new(AtomicBool::new(false)),
-            last_good_value: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -110,9 +116,9 @@ impl Backend {
         // Capture the version at spawn time.  If a newer edit arrives before this task
         // wakes up, `current_version` will differ from `spawn_version` and the task discards.
         let spawn_version = {
-            let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             match docs.get(&uri) {
-                Some((v, _)) => *v,
+                Some(state) => state.version,
                 None => return,
             }
         };
@@ -145,8 +151,9 @@ impl Backend {
         //    This is critical — capturing content at didChange time can produce stale
         //    content that passes the version guard (the debounce race condition).
         let snapshot = {
-            let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.get(&uri).map(|(v, c)| (*v, c.clone()))
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            docs.get(&uri)
+                .map(|state| (state.version, state.content.clone()))
         };
         let Some((current_version, content)) = snapshot else {
             return; // Document was closed during the debounce window.
@@ -217,23 +224,23 @@ impl Backend {
                 .await;
         }
 
-        // 7. Post-validation version guard: discard if a newer edit arrived during validation
-        //    or the document was closed (None from the map → discard, not publish).
-        let still_current = {
-            let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.get(&uri).map(|(v, _)| *v == version).unwrap_or(false)
-        };
-
-        if !still_current {
-            return;
-        }
-
-        // 8. Update stale value cache if the parse succeeded.
-        if let Some(value) = parsed_value {
-            self.last_good_value
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(uri.clone(), value);
+        // 7. Post-validation version guard + update stale value cache.
+        //    Done in a single lock acquisition to avoid a TOCTOU race where a new
+        //    edit could arrive between the version check and the cache update.
+        {
+            let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            let still_current = docs
+                .get(&uri)
+                .map(|state| state.version == version)
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+            if let Some(value) = parsed_value
+                && let Some(state) = docs.get_mut(&uri)
+            {
+                state.last_good_value = Some(value);
+            }
         }
 
         // 9. Convert and publish diagnostics.
@@ -256,8 +263,8 @@ impl Backend {
 
     /// Snapshot the current document text for the given URI.
     fn snapshot_document(&self, uri: &Uri) -> Option<Arc<String>> {
-        let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-        docs.get(uri).map(|(_, c)| c.clone())
+        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+        docs.get(uri).map(|state| state.content.clone())
     }
 
     /// Resolve the schema source for a document URI, compile it, and return
@@ -448,8 +455,15 @@ impl LanguageServer for Backend {
         }
 
         {
-            let mut docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.insert(uri.clone(), (version, Arc::new(content)));
+            let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            docs.insert(
+                uri.clone(),
+                DocumentState {
+                    version,
+                    content: Arc::new(content),
+                    last_good_value: None,
+                },
+            );
         }
 
         self.spawn_validation(uri);
@@ -465,8 +479,11 @@ impl LanguageServer for Backend {
         };
 
         {
-            let mut docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.insert(uri.clone(), (version, Arc::new(content)));
+            let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = docs.get_mut(&uri) {
+                state.version = version;
+                state.content = Arc::new(content);
+            }
         }
 
         self.spawn_validation(uri);
@@ -476,13 +493,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
 
         // Remove from document map so any in-flight validation discards its result.
-        self.document_map
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&uri);
-
-        // Remove from stale value cache.
-        self.last_good_value
+        self.documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&uri);
@@ -562,11 +573,11 @@ impl LanguageServer for Backend {
             Ok(p) => Arc::new(p.value),
             Err(_) => {
                 let stale = self
-                    .last_good_value
+                    .documents
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&uri)
-                    .cloned();
+                    .and_then(|state| state.last_good_value.clone());
                 match stale {
                     Some(v) => v,
                     None => return Ok(None),
@@ -675,7 +686,7 @@ impl LanguageServer for Backend {
         // Only re-validate if something was actually invalidated.
         if config_changed || schema_changed {
             let uris: Vec<Uri> = self
-                .document_map
+                .documents
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .keys()
