@@ -1,7 +1,7 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,6 +63,10 @@ pub struct Backend {
     validation_semaphore: Arc<Semaphore>,
     /// True if the client negotiated UTF-8 position encoding; false = UTF-16 (default).
     utf8_positions: Arc<AtomicBool>,
+    /// Schema file paths for which we have registered file watchers.
+    watched_schema_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Monotonically increasing counter for unique watcher registration IDs.
+    next_reg_id: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -80,6 +84,8 @@ impl Backend {
             schema_cache: Arc::new(SchemaCache::new()),
             validation_semaphore: Arc::new(Semaphore::new(8)),
             utf8_positions: Arc::new(AtomicBool::new(false)),
+            watched_schema_paths: Arc::new(Mutex::new(HashSet::new())),
+            next_reg_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -219,6 +225,60 @@ impl Backend {
         self.client
             .publish_diagnostics(uri, diagnostics, None)
             .await;
+
+        // Register file watchers for any newly discovered schema files.
+        self.update_schema_watchers().await;
+    }
+
+    /// Register file watchers for newly discovered schema file paths.
+    ///
+    /// Queries the schema cache for all `SchemaSource::File` entries and
+    /// registers a watcher for each path not already being watched.
+    async fn update_schema_watchers(&self) {
+        let new_paths: Vec<PathBuf> = {
+            let mut watched = self
+                .watched_schema_paths
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.schema_cache
+                .cached_file_paths()
+                .into_iter()
+                .filter(|p| watched.insert(p.clone()))
+                .collect()
+        };
+
+        if new_paths.is_empty() {
+            return;
+        }
+
+        let watchers: Vec<FileSystemWatcher> = new_paths
+            .iter()
+            .map(|p| FileSystemWatcher {
+                glob_pattern: GlobPattern::String(escape_glob_metacharacters(
+                    &p.display().to_string(),
+                )),
+                kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+            })
+            .collect();
+
+        let reg_id = self.next_reg_id.fetch_add(1, Ordering::Relaxed);
+        let registration = Registration {
+            id: format!("jvl-schema-watch-{reg_id}"),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(
+                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                    .unwrap(),
+            ),
+        };
+
+        if let Err(e) = self.client.register_capability(vec![registration]).await {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("jvl: failed to register schema file watcher ({e})"),
+                )
+                .await;
+        }
     }
 }
 
@@ -348,32 +408,54 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        // Evict config cache entries for any changed jvl.json files.
         let changed: Vec<PathBuf> = params
             .changes
             .iter()
             .filter_map(|c| c.uri.to_file_path().map(Cow::into_owned))
-            .filter(|p| p.file_name() == Some(std::ffi::OsStr::new("jvl.json")))
             .collect();
 
-        if !changed.is_empty() {
+        // Evict config cache for jvl.json changes.
+        let mut config_changed = false;
+        {
             let mut cache = self.config_cache.lock().unwrap_or_else(|e| e.into_inner());
             for path in &changed {
-                cache.remove(path);
+                if path.file_name() == Some(std::ffi::OsStr::new("jvl.json")) {
+                    cache.remove(path);
+                    config_changed = true;
+                }
             }
         }
 
-        // Re-validate all open documents so diagnostics reflect the updated config.
-        let uris: Vec<Uri> = self
-            .document_map
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect();
+        // On config change, clear watched schema paths so they are
+        // rediscovered during re-validation.
+        if config_changed {
+            self.watched_schema_paths
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
 
-        for uri in uris {
-            self.spawn_validation(uri);
+        // Evict schema cache for changed files.
+        let mut schema_changed = false;
+        for path in &changed {
+            if self.schema_cache.evict(&SchemaSource::file(path.clone())) {
+                schema_changed = true;
+            }
+        }
+
+        // Only re-validate if something was actually invalidated.
+        if config_changed || schema_changed {
+            let uris: Vec<Uri> = self
+                .document_map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .cloned()
+                .collect();
+
+            for uri in uris {
+                self.spawn_validation(uri);
+            }
         }
     }
 }
@@ -558,6 +640,18 @@ fn file_diagnostic_to_lsp(
         message: diag.message.clone(),
         ..Default::default()
     }
+}
+
+/// Escape glob metacharacters in a path string so it is treated as a literal.
+fn escape_glob_metacharacters(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '{' | '}') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 /// Start the LSP server over stdio.
