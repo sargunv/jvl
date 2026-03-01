@@ -343,13 +343,17 @@ pub fn completion_context(source: &str, byte_offset: usize) -> Option<Completion
                 continue;
             }
             if b == b'"' {
-                // String closed. If we're in an object and not after colon,
-                // this string was a property key.
+                // String closed.
                 if let Some(level) = stack.last_mut()
                     && level.is_object
-                    && !level.after_colon
                 {
-                    level.last_key_content = Some((string_content_start, i));
+                    if !level.after_colon {
+                        // This string was a property key.
+                        level.last_key_content = Some((string_content_start, i));
+                    } else {
+                        // This string was a property value; value consumed.
+                        level.after_colon = false;
+                    }
                 }
                 in_string = false;
             }
@@ -404,9 +408,14 @@ pub fn completion_context(source: &str, byte_offset: usize) -> Option<Completion
             }
             b'}' | b']' => {
                 stack.pop();
-                // After closing a nested container that was a value, the parent's
-                // after_colon should remain true (waiting for comma). This is
-                // already the case since we don't reset it here.
+                // After closing a nested container that was a value, reset the
+                // parent's after_colon so the parent is back in key position.
+                if let Some(level) = stack.last_mut()
+                    && level.is_object
+                    && level.after_colon
+                {
+                    level.after_colon = false;
+                }
             }
             b':' => {
                 if let Some(level) = stack.last_mut()
