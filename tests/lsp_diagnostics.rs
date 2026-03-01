@@ -267,6 +267,55 @@ async fn strict_mode_non_matching_file_no_diagnostic() {
     );
 }
 
+/// When canonicalize fails (non-existent file), the LSP logs a fallback warning.
+#[tokio::test]
+async fn fallback_path_logs_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("jvl.json"), r#"{}"#).unwrap();
+
+    // Point at a non-existent file so std::fs::canonicalize fails,
+    // triggering the strip_prefix fallback and the warning log.
+    let file_path = dir.path().join("nonexistent.json");
+    let uri = file_uri(file_path.to_str().unwrap());
+
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    client.did_open(&uri, "json", 1, r#"{"key": "val"}"#).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Collect messages until publishDiagnostics, checking for the fallback warning.
+    let mut found_warning = false;
+    loop {
+        let msg = client.recv().await;
+        if let Some(method) = msg["method"].as_str() {
+            if method == "window/logMessage" {
+                let message = msg["params"]["message"].as_str().unwrap_or("");
+                if message.contains("could not relativize path") {
+                    assert!(
+                        message.contains("nonexistent.json"),
+                        "warning should include the document path: {message}"
+                    );
+                    assert!(
+                        message.contains("project root"),
+                        "warning should mention project root: {message}"
+                    );
+                    found_warning = true;
+                }
+            }
+            if method == "textDocument/publishDiagnostics" {
+                break;
+            }
+        }
+    }
+
+    assert!(
+        found_warning,
+        "expected a window/logMessage warning about path relativization fallback"
+    );
+}
+
 /// Non-file:// URIs are handled gracefully — no crash, and any notification received
 /// should have empty diagnostics (server skips non-file URIs).
 #[tokio::test]

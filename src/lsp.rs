@@ -31,6 +31,24 @@ struct ResolvedDocument {
     config_log: Option<String>,
 }
 
+impl ResolvedDocument {
+    fn skip() -> Self {
+        Self {
+            schema_source: None,
+            strict: false,
+            config_log: None,
+        }
+    }
+
+    fn error(msg: String) -> Self {
+        Self {
+            schema_source: None,
+            strict: false,
+            config_log: Some(msg),
+        }
+    }
+}
+
 /// LSP server backend.
 #[derive(Clone)]
 pub struct Backend {
@@ -370,11 +388,7 @@ fn resolve_schema_for_document(
 ) -> ResolvedDocument {
     // Find the nearest jvl.json by walking up the directory tree.
     let Some(config_path) = discover::find_config_file(path) else {
-        return ResolvedDocument {
-            schema_source: None,
-            strict: false,
-            config_log: None,
-        };
+        return ResolvedDocument::skip();
     };
 
     // Check the cache first (fast path — no disk I/O after first load).
@@ -390,44 +404,34 @@ fn resolve_schema_for_document(
             let config = match Config::load(&config_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    return ResolvedDocument {
-                        schema_source: None,
-                        strict: false,
-                        config_log: Some(format!(
-                            "jvl: failed to load {}: {e}",
-                            config_path.display()
-                        )),
-                    };
+                    return ResolvedDocument::error(format!(
+                        "jvl: failed to load {}: {e}",
+                        config_path.display()
+                    ));
                 }
             };
 
-            let project_root = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let raw_root = config_path.parent().unwrap_or(Path::new("."));
+            let project_root =
+                std::fs::canonicalize(raw_root).unwrap_or_else(|_| raw_root.to_path_buf());
 
             let mappings = match discover::CompiledSchemaMappings::compile(&config) {
                 Ok(m) => m,
                 Err(e) => {
-                    return ResolvedDocument {
-                        schema_source: None,
-                        strict: false,
-                        config_log: Some(format!(
-                            "jvl: failed to compile schema mappings from {}: {e}",
-                            config_path.display()
-                        )),
-                    };
+                    return ResolvedDocument::error(format!(
+                        "jvl: failed to compile schema mappings from {}: {e}",
+                        config_path.display()
+                    ));
                 }
             };
 
             let file_filter = match CompiledFileFilter::compile(&config) {
                 Ok(f) => f,
                 Err(e) => {
-                    return ResolvedDocument {
-                        schema_source: None,
-                        strict: false,
-                        config_log: Some(format!(
-                            "jvl: failed to compile file patterns from {}: {e}",
-                            config_path.display()
-                        )),
-                    };
+                    return ResolvedDocument::error(format!(
+                        "jvl: failed to compile file patterns from {}: {e}",
+                        config_path.display()
+                    ));
                 }
             };
 
@@ -446,28 +450,35 @@ fn resolve_schema_for_document(
     };
 
     // Compute the path relative to the project root for glob matching.
-    let relative = std::fs::canonicalize(path)
-        .ok()
-        .and_then(|abs| {
-            abs.strip_prefix(&compiled.project_root)
-                .ok()
-                .map(|r| r.to_string_lossy().to_string())
-        })
-        .unwrap_or_else(|| path.to_string_lossy().to_string());
+    // project_root is already canonicalized at cache-fill time, so we just need
+    // to canonicalize the document path to match.
+    let canonical_path = std::fs::canonicalize(path);
+    let stripped = canonical_path.as_ref().ok().and_then(|abs| {
+        abs.strip_prefix(&compiled.project_root)
+            .ok()
+            .map(|r| r.to_string_lossy().to_string())
+    });
+    let fallback_warning = if stripped.is_none() {
+        Some(format!(
+            "jvl: could not relativize path {} against project root {}; \
+             glob patterns may not match",
+            path.display(),
+            compiled.project_root.display(),
+        ))
+    } else {
+        None
+    };
+    let relative = stripped.unwrap_or_else(|| path.to_string_lossy().to_string());
 
     // Only validate files that match the config's files patterns.
     if !compiled.file_filter.matches(&relative) {
-        return ResolvedDocument {
-            schema_source: None,
-            strict: false,
-            config_log: None,
-        };
+        return ResolvedDocument::skip();
     }
 
     ResolvedDocument {
         schema_source: compiled.mappings.resolve(&relative, &compiled.project_root),
         strict: compiled.strict,
-        config_log: None,
+        config_log: fallback_warning,
     }
 }
 
