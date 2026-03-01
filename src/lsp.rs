@@ -54,7 +54,8 @@ impl ResolvedDocument {
 pub struct Backend {
     client: Client,
     /// Open documents: URI → (LSP version, full text content)
-    document_map: Arc<Mutex<HashMap<Uri, (i32, String)>>>,
+    #[allow(clippy::type_complexity)]
+    document_map: Arc<Mutex<HashMap<Uri, (i32, Arc<String>)>>>,
     /// jvl.json config cache: config file path → compiled config
     config_cache: Arc<Mutex<HashMap<PathBuf, Arc<CompiledConfig>>>>,
     /// Compiled JSON Schema validator cache (shared with validate_file)
@@ -67,6 +68,8 @@ pub struct Backend {
     watched_schema_paths: Arc<Mutex<HashSet<PathBuf>>>,
     /// Monotonically increasing counter for unique watcher registration IDs.
     next_reg_id: Arc<AtomicU64>,
+    /// True if the client supports Markdown in hover content.
+    hover_markdown: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -86,6 +89,7 @@ impl Backend {
             utf8_positions: Arc::new(AtomicBool::new(false)),
             watched_schema_paths: Arc::new(Mutex::new(HashSet::new())),
             next_reg_id: Arc::new(AtomicU64::new(0)),
+            hover_markdown: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -298,6 +302,15 @@ impl LanguageServer for Backend {
 
         self.utf8_positions.store(utf8, Ordering::Relaxed);
 
+        // Check if client supports Markdown in hover content.
+        if let Some(text_doc) = &params.capabilities.text_document
+            && let Some(hover_caps) = &text_doc.hover
+            && let Some(formats) = &hover_caps.content_format
+        {
+            self.hover_markdown
+                .store(formats.contains(&MarkupKind::Markdown), Ordering::Relaxed);
+        }
+
         let position_encoding = if utf8 {
             PositionEncodingKind::UTF8
         } else {
@@ -372,7 +385,7 @@ impl LanguageServer for Backend {
 
         {
             let mut docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.insert(uri.clone(), (version, content));
+            docs.insert(uri.clone(), (version, Arc::new(content)));
         }
 
         self.spawn_validation(uri);
@@ -389,7 +402,7 @@ impl LanguageServer for Backend {
 
         {
             let mut docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.insert(uri.clone(), (version, content));
+            docs.insert(uri.clone(), (version, Arc::new(content)));
         }
 
         self.spawn_validation(uri);
@@ -454,23 +467,22 @@ impl LanguageServer for Backend {
         };
         let resolved = resolve_schema_for_document(&file_path, &self.config_cache);
 
-        // If no schema source, try the $schema field in the document itself.
-        let schema_source = match resolved.schema_source {
+        // If no schema source from config, try the $schema field in the document itself.
+        let schema_source = match resolved
+            .schema_source
+            .or_else(|| schema::resolve_schema_from_value(&parsed.value, &file_path))
+        {
             Some(s) => s,
-            None => match parse::extract_schema_field(&parsed.value) {
-                Some(schema_ref) => {
-                    let base_dir = file_path.parent().unwrap_or(Path::new("."));
-                    schema::resolve_schema_ref(schema_ref, base_dir)
-                }
-                None => return Ok(None),
-            },
+            None => return Ok(None),
         };
 
         // 6. Ensure schema is compiled and get the raw schema value.
-        // Trigger compilation if not yet cached (the validator result is unused).
-        let _ = self.schema_cache.get_or_compile(&schema_source, false);
-        let Some(schema_value) = self.schema_cache.get_schema_value(&schema_source) else {
-            return Ok(None);
+        let schema_value = match self
+            .schema_cache
+            .get_or_compile_with_value(&schema_source, false)
+        {
+            Ok(Some(v)) => v,
+            _ => return Ok(None),
         };
 
         // 7. Look up hover content from schema annotations.
@@ -479,43 +491,21 @@ impl LanguageServer for Backend {
         };
 
         // 8. Convert node_range back to LSP Range.
-        let (start_line_1, start_col_1) = parse::offset_to_line_col(&line_starts, node_range.start);
-        let start_line_idx = start_line_1.saturating_sub(1);
-        let start_line_start = line_starts
-            .get(start_line_idx)
-            .copied()
-            .unwrap_or(content.len());
-        let start_line_end = line_starts
-            .get(start_line_idx + 1)
-            .copied()
-            .unwrap_or(content.len());
-        let start_line_text = &content[start_line_start..start_line_end];
-        let start_byte_col = start_col_1.saturating_sub(1);
-        let start_char = byte_col_to_lsp(start_line_text, start_byte_col, utf8);
+        let start_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.start, utf8);
+        let end_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.end, utf8);
 
-        let (end_line_1, end_col_1) = parse::offset_to_line_col(&line_starts, node_range.end);
-        let end_line_idx = end_line_1.saturating_sub(1);
-        let end_line_start = line_starts
-            .get(end_line_idx)
-            .copied()
-            .unwrap_or(content.len());
-        let end_line_end = line_starts
-            .get(end_line_idx + 1)
-            .copied()
-            .unwrap_or(content.len());
-        let end_line_text = &content[end_line_start..end_line_end];
-        let end_byte_col = end_col_1.saturating_sub(1);
-        let end_char = byte_col_to_lsp(end_line_text, end_byte_col, utf8);
+        let kind = if self.hover_markdown.load(Ordering::Relaxed) {
+            MarkupKind::Markdown
+        } else {
+            MarkupKind::PlainText
+        };
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
+                kind,
                 value: hover_content,
             }),
-            range: Some(Range::new(
-                Position::new(start_line_idx as u32, start_char),
-                Position::new(end_line_idx as u32, end_char),
-            )),
+            range: Some(Range::new(start_pos, end_pos)),
         }))
     }
 
@@ -676,6 +666,29 @@ fn resolve_schema_for_document(
     }
 }
 
+/// Convert a byte offset in `source` to an LSP `Position`.
+///
+/// Uses `offset_to_line_col` to find the 1-based line/column, then converts
+/// the byte column to the negotiated LSP encoding (UTF-8 or UTF-16).
+fn byte_offset_to_lsp_position(
+    source: &str,
+    line_starts: &[usize],
+    offset: usize,
+    utf8: bool,
+) -> Position {
+    let (line_1, col_1) = parse::offset_to_line_col(line_starts, offset);
+    let line_idx = line_1.saturating_sub(1);
+    let line_start = line_starts.get(line_idx).copied().unwrap_or(source.len());
+    let line_end = line_starts
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(source.len());
+    let line_text = &source[line_start..line_end];
+    let byte_col = col_1.saturating_sub(1);
+    let lsp_char = byte_col_to_lsp(line_text, byte_col, utf8);
+    Position::new(line_idx as u32, lsp_char)
+}
+
 /// Convert a byte column offset to an LSP character offset using the negotiated encoding.
 fn byte_col_to_lsp(line: &str, byte_col: usize, utf8: bool) -> u32 {
     let safe_col = byte_col.min(line.len());
@@ -734,23 +747,7 @@ fn file_diagnostic_to_lsp(
 
             // End position is derived from the span's byte offset + length.
             let end_offset = loc.offset + loc.length;
-            let (end_line_1based, end_col_1based) =
-                parse::offset_to_line_col(line_starts, end_offset);
-            let end_line_idx = end_line_1based.saturating_sub(1);
-            let end_line_start = line_starts
-                .get(end_line_idx)
-                .copied()
-                .unwrap_or(source.len());
-            let end_line_end = line_starts
-                .get(end_line_idx + 1)
-                .copied()
-                .unwrap_or(source.len());
-            let end_line_text = source[end_line_start..end_line_end]
-                .trim_end_matches('\n')
-                .trim_end_matches('\r');
-            let end_byte_col = end_col_1based.saturating_sub(1);
-            let end_char = byte_col_to_lsp(end_line_text, end_byte_col, utf8);
-            let end_pos = Position::new(end_line_idx as u32, end_char);
+            let end_pos = byte_offset_to_lsp_position(source, line_starts, end_offset, utf8);
 
             (start_pos, end_pos)
         }

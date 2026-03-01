@@ -8,6 +8,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::diagnostic::Warning;
+use crate::parse;
 
 /// Custom retriever that routes `$ref` fetches through jvl's disk cache.
 struct CachingRetriever {
@@ -149,6 +150,21 @@ pub fn resolve_schema_ref(schema_ref: &str, base_dir: &Path) -> SchemaSource {
         };
         SchemaSource::file(abs)
     }
+}
+
+/// Try to resolve a schema source from the `$schema` field in a parsed JSON value.
+///
+/// Returns `None` if the value has no `$schema` string field. Relative paths
+/// in the `$schema` value are resolved against the parent directory of
+/// `file_path`.
+pub fn resolve_schema_from_value(
+    parsed_value: &serde_json::Value,
+    file_path: &Path,
+) -> Option<SchemaSource> {
+    parse::extract_schema_field(parsed_value).map(|schema_ref| {
+        let base_dir = file_path.parent().unwrap_or(Path::new("."));
+        resolve_schema_ref(schema_ref, base_dir)
+    })
 }
 
 /// Cache directory for fetched schemas.
@@ -529,6 +545,19 @@ impl SchemaCache {
         result.schema_value.clone()
     }
 
+    /// Get or compile the schema and return the raw schema JSON value.
+    ///
+    /// Combines [`get_or_compile`](Self::get_or_compile) and
+    /// [`get_schema_value`](Self::get_schema_value) in a single operation.
+    pub fn get_or_compile_with_value(
+        &self,
+        source: &SchemaSource,
+        no_cache: bool,
+    ) -> Result<Option<Arc<serde_json::Value>>, SchemaError> {
+        let _ = self.get_or_compile(source, no_cache)?;
+        Ok(self.get_schema_value(source))
+    }
+
     /// Get or load+compile a schema validator.
     ///
     /// Returns `(validator, warnings, cache_outcome)`. The validator is wrapped
@@ -628,15 +657,71 @@ impl SchemaCache {
     }
 }
 
+/// Schema annotations (title/description) for a JSON path.
+pub struct SchemaAnnotation {
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+impl SchemaAnnotation {
+    /// Format as Markdown for LSP hover display.
+    ///
+    /// Returns `None` if both `title` and `description` are `None`.
+    pub fn to_markdown(&self) -> Option<String> {
+        const MAX_LEN: usize = 10_000;
+        let truncate = |s: &str| -> String {
+            if s.len() > MAX_LEN {
+                let end = s.floor_char_boundary(MAX_LEN);
+                format!("{}...", &s[..end])
+            } else {
+                s.to_string()
+            }
+        };
+
+        match (self.title.as_deref(), self.description.as_deref()) {
+            (Some(t), Some(d)) => Some(format!("**{}**\n\n{}", truncate(t), truncate(d))),
+            (Some(t), None) => Some(format!("**{}**", truncate(t))),
+            (None, Some(d)) => Some(truncate(d)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Walk a raw schema `serde_json::Value` following a JSON pointer path and
+/// return structured schema annotations (title/description).
+///
+/// Handles `properties`, `items`/`prefixItems`, and fragment-only `$ref`.
+/// Returns `None` if no `title` or `description` annotation is found.
+pub fn lookup_schema_annotation(
+    schema: &serde_json::Value,
+    pointer: &[String],
+) -> Option<SchemaAnnotation> {
+    let mut visited_refs: HashSet<String> = HashSet::new();
+    let subschema = resolve_subschema(schema, schema, pointer, &mut visited_refs)?;
+
+    let title = subschema
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let description = subschema
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if title.is_none() && description.is_none() {
+        return None;
+    }
+
+    Some(SchemaAnnotation { title, description })
+}
+
 /// Walk a raw schema `serde_json::Value` following a JSON pointer path and
 /// return formatted hover content (title/description as Markdown).
 ///
 /// Handles `properties`, `items`/`prefixItems`, and fragment-only `$ref`.
 /// Returns `None` if no `title` or `description` annotation is found.
 pub fn lookup_hover_content(schema: &serde_json::Value, pointer: &[String]) -> Option<String> {
-    let mut visited_refs: HashSet<String> = HashSet::new();
-    let subschema = resolve_subschema(schema, schema, pointer, &mut visited_refs)?;
-    format_hover(subschema)
+    lookup_schema_annotation(schema, pointer)?.to_markdown()
 }
 
 /// Resolve the subschema at a given JSON pointer path within a schema.
@@ -719,28 +804,6 @@ fn follow_ref<'a>(
 
     // Recursively follow if the target itself has a $ref.
     follow_ref(root, target, visited)
-}
-
-/// Format a subschema's title/description as Markdown hover content.
-fn format_hover(subschema: &serde_json::Value) -> Option<String> {
-    let title = subschema.get("title").and_then(|v| v.as_str());
-    let description = subschema.get("description").and_then(|v| v.as_str());
-
-    const MAX_LEN: usize = 10_000;
-    let truncate = |s: &str| -> String {
-        if s.len() > MAX_LEN {
-            format!("{}...", &s[..MAX_LEN])
-        } else {
-            s.to_string()
-        }
-    };
-
-    match (title, description) {
-        (Some(t), Some(d)) => Some(format!("**{}**\n\n{}", truncate(t), truncate(d))),
-        (Some(t), None) => Some(format!("**{}**", truncate(t))),
-        (None, Some(d)) => Some(truncate(d)),
-        (None, None) => None,
-    }
 }
 
 #[cfg(test)]
@@ -946,5 +1009,24 @@ mod tests {
         });
         let result = lookup_hover_content(&schema, &["coords".into(), "1".into()]);
         assert_eq!(result, Some("**Y**\n\nY coordinate".into()));
+    }
+
+    #[test]
+    fn hover_truncate_multibyte_boundary() {
+        // Place a 4-byte emoji (U+1F600) right at the 10,000-byte boundary.
+        let prefix = "x".repeat(9_999);
+        let long_desc = format!("{prefix}\u{1F600}extra");
+
+        let schema = serde_json::json!({
+            "properties": {
+                "x": { "description": long_desc }
+            }
+        });
+
+        // Must not panic, and must produce valid truncated output.
+        let result = lookup_hover_content(&schema, &["x".into()]).unwrap();
+        assert!(result.ends_with("..."));
+        // The emoji straddles byte 10,000, so it should be excluded.
+        assert!(!result.contains('\u{1F600}'));
     }
 }
