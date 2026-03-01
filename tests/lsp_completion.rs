@@ -470,6 +470,60 @@ async fn completion_type_array_values() {
     );
 }
 
+/// Array item completions from items enum.
+#[tokio::test]
+async fn completion_array_item_enum() {
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    // {"$schema": "...", "tags": []}
+    let content = doc_with_schema(r#""tags": []"#);
+    let uri = doc_uri();
+    open_and_wait(&mut client, &uri, &content).await;
+
+    // Cursor inside the [] — find position of [
+    let bracket = content.rfind('[').unwrap();
+    let cursor_col = (bracket + 1) as u32; // just after [
+    let result = client.completion(&uri, 0, cursor_col).await;
+
+    let names = labels(&result);
+    assert!(
+        names.contains(&r#""frontend""#.to_string()),
+        "expected '\"frontend\"' in array item completions, got: {names:?}"
+    );
+    assert!(
+        names.contains(&r#""backend""#.to_string()),
+        "expected '\"backend\"' in array item completions, got: {names:?}"
+    );
+    assert!(
+        names.contains(&r#""devops""#.to_string()),
+        "expected '\"devops\"' in array item completions, got: {names:?}"
+    );
+}
+
+/// Array item completions after existing items.
+#[tokio::test]
+async fn completion_array_item_after_comma() {
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    // {"$schema": "...", "tags": ["frontend", ]}
+    let content = doc_with_schema(r#""tags": ["frontend", ]"#);
+    let uri = doc_uri();
+    open_and_wait(&mut client, &uri, &content).await;
+
+    // Cursor after the comma, before ]
+    let bracket = content.rfind(']').unwrap();
+    let cursor_col = (bracket - 1) as u32; // space before ]
+    let result = client.completion(&uri, 0, cursor_col).await;
+
+    let names = labels(&result);
+    assert!(
+        names.contains(&r#""backend""#.to_string()),
+        "expected '\"backend\"' in array item completions after comma, got: {names:?}"
+    );
+}
+
 /// Completion includes documentation from schema description.
 #[tokio::test]
 async fn completion_includes_documentation() {

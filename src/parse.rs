@@ -278,16 +278,26 @@ pub enum CompletionContext {
         /// Byte offset where the replacement should start.
         replace_start: usize,
     },
+    /// Cursor is in a position where an array item should go.
+    ArrayItem {
+        /// JSON pointer path that resolves to the array schema (e.g.,
+        /// `["tags"]` for a cursor inside `"tags": [|]`). Nested arrays
+        /// use `"0"` segments to traverse through `items` (e.g.,
+        /// `["matrix", "0"]` for `"matrix": [[|]]`).
+        pointer: Vec<String>,
+        /// Byte offset where the replacement should start.
+        replace_start: usize,
+    },
 }
 
 /// Determine the completion context at a byte offset by scanning the source text.
 ///
 /// Scans forward from the start of the document, tracking string boundaries,
 /// comments, and brace nesting to determine whether the cursor is at a property
-/// key or value position within a JSON object.
+/// key position, property value position, or array item position.
 ///
-/// Returns `None` if the cursor is inside a comment, inside an array (not a
-/// nested object), or at the document root outside any object.
+/// Returns `None` if the cursor is inside a comment or at the document root
+/// outside any container.
 pub fn completion_context(source: &str, byte_offset: usize) -> Option<CompletionContext> {
     let end = byte_offset.min(source.len());
     let bytes = source.as_bytes();
@@ -404,11 +414,20 @@ pub fn completion_context(source: &str, byte_offset: usize) -> Option<Completion
                 });
             }
             b'[' => {
+                let parent_key = stack.last().and_then(|parent| {
+                    if parent.is_object && parent.after_colon {
+                        parent
+                            .last_key_content
+                            .map(|(s, e)| source[s..e].to_string())
+                    } else {
+                        None
+                    }
+                });
                 stack.push(Level {
                     is_object: false,
                     after_colon: false,
                     last_key_content: None,
-                    parent_key: None,
+                    parent_key,
                 });
             }
             b'}' | b']' => {
@@ -457,6 +476,38 @@ pub fn completion_context(source: &str, byte_offset: usize) -> Option<Completion
             .collect()
     };
 
+    // When the cursor is inside a string, the replacement should start at the
+    // opening quote so a text_edit can replace the auto-paired `""` pair.
+    let replace_start = if in_string {
+        string_content_start - 1
+    } else {
+        byte_offset
+    };
+
+    // Check the innermost container level.
+    let innermost = stack.last()?;
+    if !innermost.is_object {
+        // Array context — build pointer including "0" for nested array levels
+        // so resolve_subschema traverses through `items` at each level.
+        let pointer: Vec<String> = stack
+            .iter()
+            .skip(1)
+            .filter_map(|l| {
+                if let Some(key) = &l.parent_key {
+                    Some(key.clone())
+                } else if !l.is_object {
+                    Some("0".to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        return Some(CompletionContext::ArrayItem {
+            pointer,
+            replace_start,
+        });
+    }
+
     // Find the innermost object level (skip any array levels on top).
     let innermost_object = stack.iter().rposition(|l| l.is_object);
 
@@ -465,14 +516,6 @@ pub fn completion_context(source: &str, byte_offset: usize) -> Option<Completion
     let obj_idx = innermost_object?;
     let level = &stack[obj_idx];
     let pointer = build_pointer(&stack[..=obj_idx]);
-
-    // When the cursor is inside a string, the replacement should start at the
-    // opening quote so a text_edit can replace the auto-paired `""` pair.
-    let replace_start = if in_string {
-        string_content_start - 1
-    } else {
-        byte_offset
-    };
 
     if level.after_colon {
         let property_name = level
@@ -749,6 +792,90 @@ mod tests {
         assert_eq!(
             result,
             Some(CompletionContext::PropertyKey {
+                pointer: vec![],
+                replace_start: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_empty_array() {
+        // {"tags": [|]}
+        let source = r#"{"tags": []}"#;
+        let result = completion_context(source, 10); // between [ and ]
+        assert_eq!(
+            result,
+            Some(CompletionContext::ArrayItem {
+                pointer: vec!["tags".into()],
+                replace_start: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_array_after_comma() {
+        // {"tags": ["a", |]}
+        let source = r#"{"tags": ["a", ]}"#;
+        let result = completion_context(source, 15); // after ", " before ]
+        assert_eq!(
+            result,
+            Some(CompletionContext::ArrayItem {
+                pointer: vec!["tags".into()],
+                replace_start: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_array_inside_string() {
+        // {"tags": ["fro|}
+        let source = r#"{"tags": ["fro"#;
+        let result = completion_context(source, 12); // inside "fro
+        assert_eq!(
+            result,
+            Some(CompletionContext::ArrayItem {
+                pointer: vec!["tags".into()],
+                replace_start: 10, // the opening quote
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_nested_array() {
+        // {"matrix": [[|]]}
+        let source = r#"{"matrix": [[]]}"#;
+        let result = completion_context(source, 13); // between inner [ and ]
+        assert_eq!(
+            result,
+            Some(CompletionContext::ArrayItem {
+                pointer: vec!["matrix".into(), "0".into()],
+                replace_start: 13,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_nested_object_array() {
+        // {"config": {"tags": [|]}}
+        let source = r#"{"config": {"tags": []}}"#;
+        let result = completion_context(source, 21); // between [ and ]
+        assert_eq!(
+            result,
+            Some(CompletionContext::ArrayItem {
+                pointer: vec!["config".into(), "tags".into()],
+                replace_start: 21,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_root_array() {
+        // [|]
+        let source = "[]";
+        let result = completion_context(source, 1); // between [ and ]
+        assert_eq!(
+            result,
+            Some(CompletionContext::ArrayItem {
                 pointer: vec![],
                 replace_start: 1,
             })
