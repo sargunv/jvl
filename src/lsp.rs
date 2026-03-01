@@ -55,9 +55,13 @@ struct DocumentState {
     version: i32,
     /// Full text content of the open document.
     content: Arc<String>,
-    /// Last successfully parsed `serde_json::Value`.
-    /// Used as a fallback when the current document text is malformed.
-    last_good_value: Option<Arc<serde_json::Value>>,
+    /// Last successfully parsed value, alongside the content it was parsed from.
+    /// Serves two purposes:
+    /// 1. **Cache hit**: if `Arc::ptr_eq(cached_content, current_content)`,
+    ///    the completion handler skips `parse_jsonc` entirely.
+    /// 2. **Stale fallback**: when the current text is malformed, the cached
+    ///    value from the last successful parse is used for completions.
+    last_good_parse: Option<(Arc<String>, Arc<serde_json::Value>)>,
 }
 
 /// LSP server backend.
@@ -239,7 +243,7 @@ impl Backend {
             if let Some(value) = parsed_value
                 && let Some(state) = docs.get_mut(&uri)
             {
-                state.last_good_value = Some(value);
+                state.last_good_parse = Some((state.content.clone(), value));
             }
         }
 
@@ -460,8 +464,10 @@ impl LanguageServer for Backend {
                 uri.clone(),
                 DocumentState {
                     version,
+                    // N.B. Always allocate a new Arc here; the completion cache
+                    // relies on `Arc::ptr_eq` to detect content changes.
                     content: Arc::new(content),
-                    last_good_value: None,
+                    last_good_parse: None,
                 },
             );
         }
@@ -482,6 +488,8 @@ impl LanguageServer for Backend {
             let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(state) = docs.get_mut(&uri) {
                 state.version = version;
+                // N.B. Always allocate a new Arc here; the completion cache
+                // relies on `Arc::ptr_eq` to detect content changes.
                 state.content = Arc::new(content);
             }
         }
@@ -568,20 +576,26 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        // 2. Try parsing current text; fall back to stale cached value.
-        let parsed_value = match parse::parse_jsonc(&content) {
-            Ok(p) => Arc::new(p.value),
-            Err(_) => {
-                let stale = self
-                    .documents
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&uri)
-                    .and_then(|state| state.last_good_value.clone());
-                match stale {
-                    Some(v) => v,
+        // 2. Check the parse cache; if the content hasn't changed since the last
+        //    successful parse, skip `parse_jsonc` entirely.
+        let cached = self
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uri)
+            .and_then(|state| state.last_good_parse.clone());
+
+        let parsed_value = if let Some((ref cached_content, ref cached_value)) = cached
+            && Arc::ptr_eq(cached_content, &content)
+        {
+            cached_value.clone()
+        } else {
+            match parse::parse_jsonc(&content) {
+                Ok(p) => Arc::new(p.value),
+                Err(_) => match cached {
+                    Some((_, v)) => v,
                     None => return Ok(None),
-                }
+                },
             }
         };
 
