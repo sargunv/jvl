@@ -265,6 +265,9 @@ pub enum CompletionContext {
         /// JSON pointer path to the containing object (e.g., `["server"]` for
         /// a cursor inside the `"server"` object). Empty for the root object.
         pointer: Vec<String>,
+        /// Byte offset where the replacement should start (the opening `"` if
+        /// the cursor is inside a string, otherwise the cursor position).
+        replace_start: usize,
     },
     /// Cursor is in a position where a property value should go.
     PropertyValue {
@@ -272,6 +275,8 @@ pub enum CompletionContext {
         property_name: String,
         /// JSON pointer path to the containing object.
         pointer: Vec<String>,
+        /// Byte offset where the replacement should start.
+        replace_start: usize,
     },
 }
 
@@ -460,6 +465,15 @@ pub fn completion_context(source: &str, byte_offset: usize) -> Option<Completion
     let obj_idx = innermost_object?;
     let level = &stack[obj_idx];
     let pointer = build_pointer(&stack[..=obj_idx]);
+
+    // When the cursor is inside a string, the replacement should start at the
+    // opening quote so a text_edit can replace the auto-paired `""` pair.
+    let replace_start = if in_string {
+        string_content_start - 1
+    } else {
+        byte_offset
+    };
+
     if level.after_colon {
         let property_name = level
             .last_key_content
@@ -468,9 +482,13 @@ pub fn completion_context(source: &str, byte_offset: usize) -> Option<Completion
         Some(CompletionContext::PropertyValue {
             property_name,
             pointer,
+            replace_start,
         })
     } else {
-        Some(CompletionContext::PropertyKey { pointer })
+        Some(CompletionContext::PropertyKey {
+            pointer,
+            replace_start,
+        })
     }
 }
 
@@ -608,7 +626,10 @@ mod tests {
         let result = completion_context(source, 1); // between { and }
         assert_eq!(
             result,
-            Some(CompletionContext::PropertyKey { pointer: vec![] })
+            Some(CompletionContext::PropertyKey {
+                pointer: vec![],
+                replace_start: 1,
+            })
         );
     }
 
@@ -619,7 +640,10 @@ mod tests {
         let result = completion_context(source, 9); // after ", " before }
         assert_eq!(
             result,
-            Some(CompletionContext::PropertyKey { pointer: vec![] })
+            Some(CompletionContext::PropertyKey {
+                pointer: vec![],
+                replace_start: 9,
+            })
         );
     }
 
@@ -633,6 +657,7 @@ mod tests {
             Some(CompletionContext::PropertyValue {
                 property_name: "name".into(),
                 pointer: vec![],
+                replace_start: 9,
             })
         );
     }
@@ -644,7 +669,10 @@ mod tests {
         let result = completion_context(source, 3); // inside "na
         assert_eq!(
             result,
-            Some(CompletionContext::PropertyKey { pointer: vec![] })
+            Some(CompletionContext::PropertyKey {
+                pointer: vec![],
+                replace_start: 1, // the opening quote
+            })
         );
     }
 
@@ -658,6 +686,7 @@ mod tests {
             Some(CompletionContext::PropertyValue {
                 property_name: "name".into(),
                 pointer: vec![],
+                replace_start: 9, // the opening quote
             })
         );
     }
@@ -671,6 +700,7 @@ mod tests {
             result,
             Some(CompletionContext::PropertyKey {
                 pointer: vec!["server".into()],
+                replace_start: 12,
             })
         );
     }
@@ -685,6 +715,7 @@ mod tests {
             Some(CompletionContext::PropertyValue {
                 property_name: "host".into(),
                 pointer: vec!["server".into()],
+                replace_start: 20,
             })
         );
     }
@@ -717,7 +748,10 @@ mod tests {
         let result = completion_context(source, 1);
         assert_eq!(
             result,
-            Some(CompletionContext::PropertyKey { pointer: vec![] })
+            Some(CompletionContext::PropertyKey {
+                pointer: vec![],
+                replace_start: 1,
+            })
         );
     }
 
@@ -731,6 +765,7 @@ mod tests {
             Some(CompletionContext::PropertyValue {
                 property_name: "name".into(),
                 pointer: vec![],
+                replace_start: 8,
             })
         );
     }

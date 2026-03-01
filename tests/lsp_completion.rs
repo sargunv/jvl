@@ -326,6 +326,63 @@ async fn completion_malformed_document_uses_stale_cache() {
     );
 }
 
+/// Completion inside auto-paired quotes uses text_edit that replaces both quotes.
+#[tokio::test]
+async fn completion_text_edit_covers_auto_paired_quotes() {
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    // First, open a valid document so the stale cache is populated.
+    let valid_content = doc_with_schema("");
+    let uri = doc_uri();
+    open_and_wait(&mut client, &uri, &valid_content).await;
+
+    // Simulate the auto-paired quote scenario: user types " after comma,
+    // editor produces "" with cursor between. The document becomes malformed:
+    // {"$schema": "...", ""}
+    let malformed = format!(r#"{{"$schema": "{}", ""}}"#, completion_schema_path());
+    client.did_change(&uri, 2, &malformed).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client
+        .recv_notification("textDocument/publishDiagnostics")
+        .await;
+
+    // Find the position of the empty "" — the auto-paired quotes before }.
+    // Search for the trailing `""}` and take its start as the opening quote.
+    let trailing = malformed.rfind(r#""}"#).unwrap();
+    let opening_quote = trailing - 1; // the opening " of the "" pair
+    // Cursor is between the quotes: after the opening ", before the closing "
+    let cursor_col = (opening_quote + 1) as u32;
+    let result = client.completion(&uri, 0, cursor_col).await;
+
+    let items = result["items"].as_array().unwrap();
+    assert!(!items.is_empty(), "expected completion items");
+
+    let name_item = items.iter().find(|i| i["label"] == "name").unwrap();
+
+    // Must use textEdit, not insertText.
+    assert!(
+        name_item.get("textEdit").is_some(),
+        "expected textEdit on completion item, got: {name_item}"
+    );
+
+    let text_edit = &name_item["textEdit"];
+    let range = &text_edit["range"];
+
+    // The range should cover both quotes of the "" pair.
+    let start_char = range["start"]["character"].as_u64().unwrap() as u32;
+    let end_char = range["end"]["character"].as_u64().unwrap() as u32;
+    assert_eq!(
+        start_char, opening_quote as u32,
+        "text_edit start should be at the opening quote"
+    );
+    assert_eq!(
+        end_char,
+        (opening_quote + 2) as u32,
+        "text_edit end should be past the closing quote"
+    );
+}
+
 /// Completion includes documentation from schema description.
 #[tokio::test]
 async fn completion_includes_documentation() {

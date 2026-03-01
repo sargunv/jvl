@@ -592,22 +592,41 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        // 6. Build completion items based on context.
+        // 6. Compute the replacement range for text_edit.
+        //    replace_start comes from completion_context (opening quote if inside
+        //    a string, otherwise the cursor position).  replace_end extends past
+        //    a closing quote at the cursor when the editor auto-paired it.
+        let replace_start = match &ctx {
+            parse::CompletionContext::PropertyKey { replace_start, .. }
+            | parse::CompletionContext::PropertyValue { replace_start, .. } => *replace_start,
+        };
+        let replace_end = if content.as_bytes().get(byte_offset) == Some(&b'"') {
+            byte_offset + 1
+        } else {
+            byte_offset
+        };
+        let replace_range = Range::new(
+            byte_offset_to_lsp_position(&content, &line_starts, replace_start, utf8),
+            byte_offset_to_lsp_position(&content, &line_starts, replace_end, utf8),
+        );
+
+        // 7. Build completion items based on context.
         let snippet = self.snippet_support.load(Ordering::Relaxed);
         let markdown = self.hover_markdown.load(Ordering::Relaxed);
 
         let items = match &ctx {
-            parse::CompletionContext::PropertyKey { pointer } => {
+            parse::CompletionContext::PropertyKey { pointer, .. } => {
                 let props = schema::collect_properties(&schema_value, pointer);
                 let existing = existing_keys(&parsed_value, pointer);
-                build_property_items(&props, &existing, snippet, markdown)
+                build_property_items(&props, &existing, snippet, markdown, replace_range)
             }
             parse::CompletionContext::PropertyValue {
                 property_name,
                 pointer,
+                ..
             } => {
                 let values = schema::collect_values(&schema_value, pointer, property_name);
-                build_value_items(&values)
+                build_value_items(&values, replace_range)
             }
         };
 
@@ -940,6 +959,7 @@ fn build_property_items(
     existing: &HashSet<String>,
     snippet: bool,
     markdown: bool,
+    replace_range: Range,
 ) -> Vec<CompletionItem> {
     props
         .iter()
@@ -972,25 +992,21 @@ fn build_property_items(
                 Some(format!("1_{}", p.name))
             };
 
-            let (insert_text, insert_text_format) = if snippet {
+            let (new_text, insert_text_format) = if snippet {
                 let value_snippet = snippet_for_type(p.schema_type.as_deref());
                 (
-                    Some(format!(
-                        "\"{}\": {}",
-                        escape_snippet(&p.name),
-                        value_snippet
-                    )),
+                    format!("\"{}\": {}", escape_snippet(&p.name), value_snippet),
                     Some(InsertTextFormat::SNIPPET),
                 )
             } else {
                 (
-                    Some(format!("\"{}\": ", p.name)),
+                    format!("\"{}\": ", p.name),
                     Some(InsertTextFormat::PLAIN_TEXT),
                 )
             };
 
             // `filter_text` lets the client match against the bare property name
-            // even though `insert_text` contains quotes and the value placeholder.
+            // even though the edit text contains quotes and the value placeholder.
             let filter_text = Some(p.name.clone());
 
             CompletionItem {
@@ -1000,7 +1016,10 @@ fn build_property_items(
                 documentation,
                 sort_text,
                 filter_text,
-                insert_text,
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replace_range,
+                    new_text,
+                })),
                 insert_text_format,
                 ..Default::default()
             }
@@ -1009,25 +1028,35 @@ fn build_property_items(
 }
 
 /// Build `CompletionItem` list from schema value suggestions.
-fn build_value_items(values: &[schema::ValueSuggestion]) -> Vec<CompletionItem> {
+fn build_value_items(
+    values: &[schema::ValueSuggestion],
+    replace_range: Range,
+) -> Vec<CompletionItem> {
+    let text_edit = |new_text: String| -> Option<CompletionTextEdit> {
+        Some(CompletionTextEdit::Edit(TextEdit {
+            range: replace_range,
+            new_text,
+        }))
+    };
+
     values
         .iter()
         .flat_map(|v| match v {
             schema::ValueSuggestion::Enum(val) => {
                 let formatted = format_json_value(val);
                 vec![CompletionItem {
-                    insert_text: Some(formatted.clone()),
-                    label: formatted,
+                    label: formatted.clone(),
                     kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    text_edit: text_edit(formatted),
                     ..Default::default()
                 }]
             }
             schema::ValueSuggestion::Const(val) => {
                 let formatted = format_json_value(val);
                 vec![CompletionItem {
-                    insert_text: Some(formatted.clone()),
-                    label: formatted,
+                    label: formatted.clone(),
                     kind: Some(CompletionItemKind::VALUE),
+                    text_edit: text_edit(formatted),
                     ..Default::default()
                 }]
             }
@@ -1036,11 +1065,13 @@ fn build_value_items(values: &[schema::ValueSuggestion]) -> Vec<CompletionItem> 
                     CompletionItem {
                         label: "true".to_string(),
                         kind: Some(CompletionItemKind::VALUE),
+                        text_edit: text_edit("true".to_string()),
                         ..Default::default()
                     },
                     CompletionItem {
                         label: "false".to_string(),
                         kind: Some(CompletionItemKind::VALUE),
+                        text_edit: text_edit("false".to_string()),
                         ..Default::default()
                     },
                 ]
@@ -1049,6 +1080,7 @@ fn build_value_items(values: &[schema::ValueSuggestion]) -> Vec<CompletionItem> 
                 vec![CompletionItem {
                     label: "null".to_string(),
                     kind: Some(CompletionItemKind::VALUE),
+                    text_edit: text_edit("null".to_string()),
                     ..Default::default()
                 }]
             }
