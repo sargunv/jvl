@@ -739,6 +739,9 @@ pub fn resolve_subschema_at_pointer<'a>(
 /// Maximum recursion depth for schema traversal (defense against pathological schemas).
 const MAX_SCHEMA_DEPTH: usize = 32;
 
+/// JSON Schema composition keywords that merge branches.
+const COMPOSITION_KEYWORDS: &[&str] = &["allOf", "oneOf", "anyOf"];
+
 /// Information about a completable property from a schema.
 #[derive(Debug, Clone)]
 pub struct PropertyInfo {
@@ -831,7 +834,7 @@ fn collect_properties_from(
     }
 
     // Recurse into allOf, oneOf, and anyOf branches.
-    for keyword in &["allOf", "oneOf", "anyOf"] {
+    for keyword in COMPOSITION_KEYWORDS {
         if let Some(branches) = schema.get(*keyword).and_then(|v| v.as_array()) {
             for branch in branches {
                 collect_properties_from(root, branch, props, seen, depth + 1);
@@ -865,17 +868,8 @@ pub fn collect_values(
     let mut suggestions = Vec::new();
 
     // Resolve to the parent schema (the containing object).
-    let parent = if pointer.is_empty() {
-        let mut visited = HashSet::new();
-        match follow_ref(root, root, &mut visited) {
-            Some(s) => s,
-            None => return suggestions,
-        }
-    } else {
-        match resolve_subschema_at_pointer(root, pointer) {
-            Some(s) => s,
-            None => return suggestions,
-        }
+    let Some(parent) = resolve_subschema_at_pointer(root, pointer) else {
+        return suggestions;
     };
 
     // Collect values from this parent's definition of the property.
@@ -911,7 +905,7 @@ fn collect_values_at_property(
     }
 
     // Walk composition branches at the parent level.
-    for keyword in &["allOf", "oneOf", "anyOf"] {
+    for keyword in COMPOSITION_KEYWORDS {
         if let Some(branches) = parent_schema.get(*keyword).and_then(|v| v.as_array()) {
             for branch in branches {
                 collect_values_at_property(root, branch, property_name, suggestions, depth + 1);
@@ -981,7 +975,7 @@ fn collect_values_from(
     }
 
     // Recurse into composition keywords.
-    for keyword in &["allOf", "oneOf", "anyOf"] {
+    for keyword in COMPOSITION_KEYWORDS {
         if let Some(branches) = schema.get(*keyword).and_then(|v| v.as_array()) {
             for branch in branches {
                 collect_values_from(root, branch, suggestions, depth + 1);
