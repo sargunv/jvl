@@ -739,6 +739,160 @@ pub fn resolve_subschema_at_pointer<'a>(
 /// Maximum recursion depth for schema traversal (defense against pathological schemas).
 const MAX_SCHEMA_DEPTH: usize = 32;
 
+/// Information about a completable property from a schema.
+#[derive(Debug, Clone)]
+pub struct PropertyInfo {
+    pub name: String,
+    pub required: bool,
+    pub description: Option<String>,
+    pub schema_type: Option<String>,
+}
+
+/// Possible value suggestions for a property.
+#[derive(Debug, Clone)]
+pub enum ValueSuggestion {
+    /// A value from a schema `enum` array.
+    Enum(serde_json::Value),
+    /// A value from a schema `const`.
+    Const(serde_json::Value),
+    /// Suggests `true` and `false`.
+    Boolean,
+    /// Suggests `null`.
+    Null,
+}
+
+/// Collect all completable properties from a schema at the given pointer path.
+///
+/// Follows `$ref` and merges `allOf` branches. Returns an empty vec if the
+/// resolved subschema is not an object schema or the pointer cannot be resolved.
+pub fn collect_properties(root: &serde_json::Value, pointer: &[String]) -> Vec<PropertyInfo> {
+    let mut visited = HashSet::new();
+    let Some(subschema) = resolve_subschema(root, root, pointer, &mut visited, 0) else {
+        return vec![];
+    };
+
+    let mut props: Vec<PropertyInfo> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+    collect_properties_from(root, subschema, &mut props, &mut seen_names, 0);
+    props
+}
+
+/// Recursively collect properties from a schema, merging allOf branches.
+fn collect_properties_from(
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    props: &mut Vec<PropertyInfo>,
+    seen: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SCHEMA_DEPTH {
+        return;
+    }
+
+    // Follow $ref.
+    let mut visited = HashSet::new();
+    let Some(schema) = follow_ref(root, schema, &mut visited) else {
+        return;
+    };
+
+    // Collect required set for this schema.
+    let required: HashSet<&str> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    // Collect properties.
+    if let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) {
+        for (name, prop_schema) in properties {
+            if !seen.insert(name.clone()) {
+                continue; // Already seen from an earlier allOf branch.
+            }
+
+            // Follow $ref on the property schema for metadata.
+            let mut prop_visited = HashSet::new();
+            let resolved_prop =
+                follow_ref(root, prop_schema, &mut prop_visited).unwrap_or(prop_schema);
+
+            let description = format_annotation(resolved_prop);
+            let schema_type = resolved_prop
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            props.push(PropertyInfo {
+                name: name.clone(),
+                required: required.contains(name.as_str()),
+                description,
+                schema_type,
+            });
+        }
+    }
+
+    // Recurse into allOf branches.
+    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
+        for branch in all_of {
+            collect_properties_from(root, branch, props, seen, depth + 1);
+        }
+    }
+}
+
+/// Format title and description from a schema node into a single string.
+fn format_annotation(schema: &serde_json::Value) -> Option<String> {
+    let title = schema.get("title").and_then(|v| v.as_str());
+    let description = schema.get("description").and_then(|v| v.as_str());
+    match (title, description) {
+        (Some(t), Some(d)) => Some(format!("{t}: {d}")),
+        (Some(t), None) => Some(t.to_string()),
+        (None, Some(d)) => Some(d.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Collect possible value suggestions for a property at the given pointer path.
+///
+/// Navigates to the subschema at `pointer` + `property_name`, then inspects
+/// `enum`, `const`, and `type` to generate value suggestions.
+pub fn collect_values(
+    root: &serde_json::Value,
+    pointer: &[String],
+    property_name: &str,
+) -> Vec<ValueSuggestion> {
+    let mut full_pointer: Vec<String> = pointer.to_vec();
+    full_pointer.push(property_name.to_string());
+
+    let Some(subschema) = resolve_subschema_at_pointer(root, &full_pointer) else {
+        return vec![];
+    };
+
+    let mut suggestions = Vec::new();
+
+    // Check for const.
+    if let Some(const_val) = subschema.get("const") {
+        suggestions.push(ValueSuggestion::Const(const_val.clone()));
+        return suggestions;
+    }
+
+    // Check for enum.
+    if let Some(enum_vals) = subschema.get("enum").and_then(|v| v.as_array()) {
+        for val in enum_vals {
+            suggestions.push(ValueSuggestion::Enum(val.clone()));
+        }
+        return suggestions;
+    }
+
+    // Check for type-based suggestions.
+    if let Some(type_str) = subschema.get("type").and_then(|v| v.as_str()) {
+        match type_str {
+            "boolean" => suggestions.push(ValueSuggestion::Boolean),
+            "null" => suggestions.push(ValueSuggestion::Null),
+            _ => {}
+        }
+    }
+
+    suggestions
+}
+
 /// Resolve the subschema at a given JSON pointer path within a schema.
 fn resolve_subschema<'a>(
     root: &'a serde_json::Value,
@@ -1112,6 +1266,139 @@ mod tests {
         let result = resolve_subschema_at_pointer(&schema, &[]);
         assert!(result.is_some());
         assert_eq!(result.unwrap().get("type").unwrap(), "object");
+    }
+
+    #[test]
+    fn collect_properties_flat() {
+        let schema = serde_json::json!({
+            "properties": {
+                "name": { "type": "string", "description": "User name" },
+                "age": { "type": "number" }
+            },
+            "required": ["name"]
+        });
+        let props = collect_properties(&schema, &[]);
+        assert_eq!(props.len(), 2);
+        let name_prop = props.iter().find(|p| p.name == "name").unwrap();
+        assert!(name_prop.required);
+        assert_eq!(name_prop.schema_type.as_deref(), Some("string"));
+        assert_eq!(name_prop.description.as_deref(), Some("User name"));
+        let age_prop = props.iter().find(|p| p.name == "age").unwrap();
+        assert!(!age_prop.required);
+    }
+
+    #[test]
+    fn collect_properties_allof_merge() {
+        let schema = serde_json::json!({
+            "allOf": [
+                {
+                    "properties": {
+                        "name": { "type": "string" }
+                    },
+                    "required": ["name"]
+                },
+                {
+                    "properties": {
+                        "age": { "type": "number" }
+                    }
+                }
+            ]
+        });
+        let props = collect_properties(&schema, &[]);
+        assert_eq!(props.len(), 2);
+        let name_prop = props.iter().find(|p| p.name == "name").unwrap();
+        assert!(name_prop.required);
+    }
+
+    #[test]
+    fn collect_properties_with_ref() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Address": {
+                    "properties": {
+                        "street": { "type": "string", "title": "Street" }
+                    }
+                }
+            },
+            "properties": {
+                "home": { "$ref": "#/$defs/Address" }
+            }
+        });
+        let props = collect_properties(&schema, &["home".into()]);
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].name, "street");
+    }
+
+    #[test]
+    fn collect_properties_nested() {
+        let schema = serde_json::json!({
+            "properties": {
+                "server": {
+                    "properties": {
+                        "host": { "type": "string" },
+                        "port": { "type": "number" }
+                    }
+                }
+            }
+        });
+        let props = collect_properties(&schema, &["server".into()]);
+        assert_eq!(props.len(), 2);
+    }
+
+    #[test]
+    fn collect_properties_empty_for_non_object() {
+        let schema = serde_json::json!({ "type": "string" });
+        let props = collect_properties(&schema, &[]);
+        assert!(props.is_empty());
+    }
+
+    #[test]
+    fn collect_values_enum() {
+        let schema = serde_json::json!({
+            "properties": {
+                "mode": {
+                    "enum": ["dark", "light", "auto"]
+                }
+            }
+        });
+        let values = collect_values(&schema, &[], "mode");
+        assert_eq!(values.len(), 3);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "dark"));
+    }
+
+    #[test]
+    fn collect_values_const() {
+        let schema = serde_json::json!({
+            "properties": {
+                "version": { "const": 2 }
+            }
+        });
+        let values = collect_values(&schema, &[], "version");
+        assert_eq!(values.len(), 1);
+        assert!(matches!(&values[0], ValueSuggestion::Const(v) if v == &serde_json::json!(2)));
+    }
+
+    #[test]
+    fn collect_values_boolean() {
+        let schema = serde_json::json!({
+            "properties": {
+                "enabled": { "type": "boolean" }
+            }
+        });
+        let values = collect_values(&schema, &[], "enabled");
+        assert_eq!(values.len(), 1);
+        assert!(matches!(&values[0], ValueSuggestion::Boolean));
+    }
+
+    #[test]
+    fn collect_values_no_suggestions() {
+        let schema = serde_json::json!({
+            "properties": {
+                "name": { "type": "string" }
+            }
+        });
+        let values = collect_values(&schema, &[], "name");
+        assert!(values.is_empty());
     }
 
     #[test]

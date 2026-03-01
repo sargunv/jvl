@@ -257,6 +257,232 @@ fn offset_to_pointer_walk(
     }
 }
 
+/// Result of analyzing cursor context for completions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionContext {
+    /// Cursor is in a position where a property key should go.
+    PropertyKey {
+        /// JSON pointer path to the containing object (e.g., `["server"]` for
+        /// a cursor inside the `"server"` object). Empty for the root object.
+        pointer: Vec<String>,
+    },
+    /// Cursor is in a position where a property value should go.
+    PropertyValue {
+        /// The property name whose value is being completed.
+        property_name: String,
+        /// JSON pointer path to the containing object.
+        pointer: Vec<String>,
+    },
+}
+
+/// Determine the completion context at a byte offset by scanning the source text.
+///
+/// Scans forward from the start of the document, tracking string boundaries,
+/// comments, and brace nesting to determine whether the cursor is at a property
+/// key or value position within a JSON object.
+///
+/// Returns `None` if the cursor is inside a comment, inside an array (not a
+/// nested object), or at the document root outside any object.
+pub fn completion_context(source: &str, byte_offset: usize) -> Option<CompletionContext> {
+    let end = byte_offset.min(source.len());
+    let bytes = source.as_bytes();
+
+    // Scanner state.
+    let mut in_string = false;
+    let mut escape = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    // Stack tracking container nesting.
+    struct Level {
+        is_object: bool,
+        /// True after `:` is seen, cleared by `,`.
+        after_colon: bool,
+        /// Byte range (start, end exclusive) of the last completed key string
+        /// at this level (content inside the quotes, not including quotes).
+        last_key_content: Option<(usize, usize)>,
+        /// Key from the parent level whose value is this container.
+        parent_key: Option<String>,
+    }
+    let mut stack: Vec<Level> = Vec::new();
+
+    // Track the start of the current string (byte after the opening `"`).
+    let mut string_content_start: usize = 0;
+
+    let mut i = 0;
+    while i < end {
+        let b = bytes[i];
+
+        if in_line_comment {
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if b == b'*' && i + 1 < end && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' {
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                // String closed. If we're in an object and not after colon,
+                // this string was a property key.
+                if let Some(level) = stack.last_mut()
+                    && level.is_object
+                    && !level.after_colon
+                {
+                    level.last_key_content = Some((string_content_start, i));
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Not in string, not in comment.
+        match b {
+            b'/' if i + 1 < end => match bytes[i + 1] {
+                b'/' => {
+                    in_line_comment = true;
+                    i += 2;
+                    continue;
+                }
+                b'*' => {
+                    in_block_comment = true;
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            },
+            b'"' => {
+                in_string = true;
+                string_content_start = i + 1;
+            }
+            b'{' => {
+                // Determine the parent key for this new object.
+                let parent_key = stack.last().and_then(|parent| {
+                    if parent.is_object && parent.after_colon {
+                        parent
+                            .last_key_content
+                            .map(|(s, e)| source[s..e].to_string())
+                    } else {
+                        None
+                    }
+                });
+                stack.push(Level {
+                    is_object: true,
+                    after_colon: false,
+                    last_key_content: None,
+                    parent_key,
+                });
+            }
+            b'[' => {
+                stack.push(Level {
+                    is_object: false,
+                    after_colon: false,
+                    last_key_content: None,
+                    parent_key: None,
+                });
+            }
+            b'}' | b']' => {
+                stack.pop();
+                // After closing a nested container that was a value, the parent's
+                // after_colon should remain true (waiting for comma). This is
+                // already the case since we don't reset it here.
+            }
+            b':' => {
+                if let Some(level) = stack.last_mut()
+                    && level.is_object
+                {
+                    level.after_colon = true;
+                }
+            }
+            b',' => {
+                if let Some(level) = stack.last_mut() {
+                    level.after_colon = false;
+                    if level.is_object {
+                        level.last_key_content = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        i += 1;
+    }
+
+    // Determine the context at the cursor position.
+    if in_line_comment || in_block_comment {
+        return None;
+    }
+
+    // Build the pointer path from the stack (skip root level, collect parent keys).
+    let build_pointer = |stack: &[Level]| -> Vec<String> {
+        stack
+            .iter()
+            .skip(1)
+            .filter_map(|l| l.parent_key.clone())
+            .collect()
+    };
+
+    // Find the innermost object level (skip any array levels on top).
+    let innermost_object = stack.iter().rposition(|l| l.is_object);
+
+    if in_string {
+        // Cursor is inside a string.
+        let obj_idx = innermost_object?;
+        let level = &stack[obj_idx];
+        let pointer = build_pointer(&stack[..=obj_idx]);
+        if level.after_colon {
+            let property_name = level
+                .last_key_content
+                .map(|(s, e)| source[s..e].to_string())
+                .unwrap_or_default();
+            Some(CompletionContext::PropertyValue {
+                property_name,
+                pointer,
+            })
+        } else {
+            Some(CompletionContext::PropertyKey { pointer })
+        }
+    } else {
+        // Cursor is on whitespace or structural tokens.
+        let obj_idx = innermost_object?;
+        let level = &stack[obj_idx];
+        let pointer = build_pointer(&stack[..=obj_idx]);
+        if level.after_colon {
+            let property_name = level
+                .last_key_content
+                .map(|(s, e)| source[s..e].to_string())
+                .unwrap_or_default();
+            Some(CompletionContext::PropertyValue {
+                property_name,
+                pointer,
+            })
+        } else {
+            Some(CompletionContext::PropertyKey { pointer })
+        }
+    }
+}
+
 /// Extract the `$schema` field from a parsed JSON value.
 pub fn extract_schema_field(value: &serde_json::Value) -> Option<&str> {
     value
@@ -380,5 +606,141 @@ mod tests {
         let parsed = parse_jsonc(source).unwrap();
         let result = offset_to_pointer(&parsed.ast, 999);
         assert!(result.is_none());
+    }
+
+    // --- completion_context tests ---
+
+    #[test]
+    fn completion_context_empty_object() {
+        // {|}
+        let source = "{}";
+        let result = completion_context(source, 1); // between { and }
+        assert_eq!(
+            result,
+            Some(CompletionContext::PropertyKey { pointer: vec![] })
+        );
+    }
+
+    #[test]
+    fn completion_context_after_comma() {
+        // {"a": 1, |}
+        let source = r#"{"a": 1, }"#;
+        let result = completion_context(source, 9); // after ", " before }
+        assert_eq!(
+            result,
+            Some(CompletionContext::PropertyKey { pointer: vec![] })
+        );
+    }
+
+    #[test]
+    fn completion_context_after_colon() {
+        // {"name": |}
+        let source = r#"{"name": }"#;
+        let result = completion_context(source, 9); // after ": " before }
+        assert_eq!(
+            result,
+            Some(CompletionContext::PropertyValue {
+                property_name: "name".into(),
+                pointer: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_inside_key_string() {
+        // {"na|}
+        let source = r#"{"na"#;
+        let result = completion_context(source, 3); // inside "na
+        assert_eq!(
+            result,
+            Some(CompletionContext::PropertyKey { pointer: vec![] })
+        );
+    }
+
+    #[test]
+    fn completion_context_inside_value_string() {
+        // {"name": "Al|}
+        let source = r#"{"name": "Al"#;
+        let result = completion_context(source, 11); // inside "Al
+        assert_eq!(
+            result,
+            Some(CompletionContext::PropertyValue {
+                property_name: "name".into(),
+                pointer: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_nested_object() {
+        // {"server": {|}}
+        let source = r#"{"server": {}}"#;
+        let result = completion_context(source, 12); // inside nested {}
+        assert_eq!(
+            result,
+            Some(CompletionContext::PropertyKey {
+                pointer: vec!["server".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_nested_value() {
+        // {"server": {"host": |}}
+        let source = r#"{"server": {"host": }}"#;
+        let result = completion_context(source, 20); // after "host":
+        assert_eq!(
+            result,
+            Some(CompletionContext::PropertyValue {
+                property_name: "host".into(),
+                pointer: vec!["server".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn completion_context_inside_comment() {
+        let source = "{ // |\n}";
+        let result = completion_context(source, 5); // inside line comment
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn completion_context_inside_block_comment() {
+        let source = "{ /* | */ }";
+        let result = completion_context(source, 5); // inside block comment
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn completion_context_document_root() {
+        let source = "  ";
+        let result = completion_context(source, 1); // outside any container
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn completion_context_just_open_brace() {
+        // Malformed: just {
+        let source = "{";
+        let result = completion_context(source, 1);
+        assert_eq!(
+            result,
+            Some(CompletionContext::PropertyKey { pointer: vec![] })
+        );
+    }
+
+    #[test]
+    fn completion_context_after_colon_no_value() {
+        // Malformed: {"name":
+        let source = r#"{"name":"#;
+        let result = completion_context(source, 8);
+        assert_eq!(
+            result,
+            Some(CompletionContext::PropertyValue {
+                property_name: "name".into(),
+                pointer: vec![],
+            })
+        );
     }
 }
