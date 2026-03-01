@@ -697,7 +697,7 @@ pub fn lookup_schema_annotation(
     pointer: &[String],
 ) -> Option<SchemaAnnotation> {
     let mut visited_refs: HashSet<String> = HashSet::new();
-    let subschema = resolve_subschema(schema, schema, pointer, &mut visited_refs)?;
+    let subschema = resolve_subschema(schema, schema, pointer, &mut visited_refs, 0)?;
 
     let title = subschema
         .get("title")
@@ -718,11 +718,26 @@ pub fn lookup_schema_annotation(
 /// Walk a raw schema `serde_json::Value` following a JSON pointer path and
 /// return formatted hover content (title/description as Markdown).
 ///
-/// Handles `properties`, `items`/`prefixItems`, and fragment-only `$ref`.
+/// Handles `properties`, `items`/`prefixItems`, `allOf`, and fragment-only `$ref`.
 /// Returns `None` if no `title` or `description` annotation is found.
 pub fn lookup_hover_content(schema: &serde_json::Value, pointer: &[String]) -> Option<String> {
     lookup_schema_annotation(schema, pointer)?.to_markdown()
 }
+
+/// Navigate to the subschema at a JSON pointer path, following `$ref` and `allOf`.
+///
+/// Public entry point that initializes cycle-detection state internally.
+/// Returns `None` if the path cannot be resolved.
+pub fn resolve_subschema_at_pointer<'a>(
+    root: &'a serde_json::Value,
+    pointer: &[String],
+) -> Option<&'a serde_json::Value> {
+    let mut visited = HashSet::new();
+    resolve_subschema(root, root, pointer, &mut visited, 0)
+}
+
+/// Maximum recursion depth for schema traversal (defense against pathological schemas).
+const MAX_SCHEMA_DEPTH: usize = 32;
 
 /// Resolve the subschema at a given JSON pointer path within a schema.
 fn resolve_subschema<'a>(
@@ -730,7 +745,12 @@ fn resolve_subschema<'a>(
     schema: &'a serde_json::Value,
     pointer: &[String],
     visited: &mut HashSet<String>,
+    depth: usize,
 ) -> Option<&'a serde_json::Value> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return None;
+    }
+
     // Follow $ref before descending.
     let schema = follow_ref(root, schema, visited)?;
 
@@ -746,7 +766,18 @@ fn resolve_subschema<'a>(
         .get("properties")
         .and_then(|p| p.get(segment.as_str()))
     {
-        return resolve_subschema(root, prop_schema, rest, visited);
+        return resolve_subschema(root, prop_schema, rest, visited, depth + 1);
+    }
+
+    // Try allOf branches.
+    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
+        for branch in all_of {
+            if let Some(result) =
+                resolve_subschema(root, branch, pointer, &mut visited.clone(), depth + 1)
+            {
+                return Some(result);
+            }
+        }
     }
 
     // Try items (for array elements with numeric index).
@@ -754,13 +785,13 @@ fn resolve_subschema<'a>(
         if let Some(items) = schema.get("items")
             && (items.is_object() || items.is_boolean())
         {
-            return resolve_subschema(root, items, rest, visited);
+            return resolve_subschema(root, items, rest, visited, depth + 1);
         }
         // Try prefixItems[i]
         if let Some(prefix_items) = schema.get("prefixItems").and_then(|p| p.as_array())
             && let Some(item_schema) = prefix_items.get(idx)
         {
-            return resolve_subschema(root, item_schema, rest, visited);
+            return resolve_subschema(root, item_schema, rest, visited, depth + 1);
         }
     }
 
@@ -1009,6 +1040,78 @@ mod tests {
         });
         let result = lookup_hover_content(&schema, &["coords".into(), "1".into()]);
         assert_eq!(result, Some("**Y**\n\nY coordinate".into()));
+    }
+
+    #[test]
+    fn hover_allof_property() {
+        let schema = serde_json::json!({
+            "allOf": [
+                {
+                    "properties": {
+                        "name": {
+                            "title": "Name",
+                            "description": "User name"
+                        }
+                    }
+                },
+                {
+                    "properties": {
+                        "age": {
+                            "title": "Age",
+                            "description": "User age"
+                        }
+                    }
+                }
+            ]
+        });
+        // Property defined in first allOf branch.
+        let result = lookup_hover_content(&schema, &["name".into()]);
+        assert_eq!(result, Some("**Name**\n\nUser name".into()));
+        // Property defined in second allOf branch.
+        let result = lookup_hover_content(&schema, &["age".into()]);
+        assert_eq!(result, Some("**Age**\n\nUser age".into()));
+    }
+
+    #[test]
+    fn hover_allof_nested() {
+        let schema = serde_json::json!({
+            "properties": {
+                "server": {
+                    "allOf": [
+                        {
+                            "properties": {
+                                "host": {
+                                    "title": "Host",
+                                    "description": "Server hostname"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["server".into(), "host".into()]);
+        assert_eq!(result, Some("**Host**\n\nServer hostname".into()));
+    }
+
+    #[test]
+    fn resolve_subschema_at_pointer_basic() {
+        let schema = serde_json::json!({
+            "properties": {
+                "name": { "type": "string", "title": "Name" }
+            }
+        });
+        let result = resolve_subschema_at_pointer(&schema, &["name".into()]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().get("title").unwrap(), "Name");
+    }
+
+    #[test]
+    fn resolve_subschema_at_pointer_empty() {
+        let schema = serde_json::json!({ "type": "object" });
+        let result = resolve_subschema_at_pointer(&schema, &[]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().get("type").unwrap(), "object");
     }
 
     #[test]

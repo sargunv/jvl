@@ -70,6 +70,9 @@ pub struct Backend {
     next_reg_id: Arc<AtomicU64>,
     /// True if the client supports Markdown in hover content.
     hover_markdown: Arc<AtomicBool>,
+    /// Last successfully parsed `serde_json::Value` per document URI.
+    /// Used as a fallback when the current document text is malformed.
+    last_good_value: Arc<Mutex<HashMap<Uri, Arc<serde_json::Value>>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -90,6 +93,7 @@ impl Backend {
             watched_schema_paths: Arc::new(Mutex::new(HashSet::new())),
             next_reg_id: Arc::new(AtomicU64::new(0)),
             hover_markdown: Arc::new(AtomicBool::new(true)),
+            last_good_value: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -167,6 +171,11 @@ impl Backend {
         let file_path_clone = file_path.clone();
 
         let result = tokio::task::spawn_blocking(move || {
+            // Try to parse for the stale value cache (cheap relative to validation).
+            let parsed_value = parse::parse_jsonc(&content_clone)
+                .ok()
+                .map(|p| Arc::new(p.value));
+
             let resolved = resolve_schema_for_document(&file_path_clone, &config_cache_clone);
 
             let validate_result = validate::validate_file(
@@ -178,11 +187,11 @@ impl Backend {
                 resolved.strict,
             );
 
-            (validate_result, resolved.config_log)
+            (validate_result, resolved.config_log, parsed_value)
         })
         .await;
 
-        let ((file_result, warnings, _, _), config_log) = match result {
+        let ((file_result, warnings, _, _), config_log, parsed_value) = match result {
             Ok(r) => r,
             Err(e) => {
                 self.client
@@ -216,7 +225,15 @@ impl Backend {
             return;
         }
 
-        // 8. Convert and publish diagnostics.
+        // 8. Update stale value cache if the parse succeeded.
+        if let Some(value) = parsed_value {
+            self.last_good_value
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(uri.clone(), value);
+        }
+
+        // 9. Convert and publish diagnostics.
         //    Compute line starts once for the full document, then pass to each converter.
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
         let line_starts = parse::compute_line_starts(&content);
@@ -443,6 +460,12 @@ impl LanguageServer for Backend {
 
         // Remove from document map so any in-flight validation discards its result.
         self.document_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
+
+        // Remove from stale value cache.
+        self.last_good_value
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&uri);
