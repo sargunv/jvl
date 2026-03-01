@@ -170,6 +170,103 @@ async fn parse_error_produces_diagnostic() {
     );
 }
 
+/// strict: true in jvl.json + file with no schema → no-schema diagnostic emitted.
+#[tokio::test]
+async fn strict_mode_no_schema_produces_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("jvl.json"), r#"{"strict": true}"#).unwrap();
+
+    let file_path = dir.path().join("test.json");
+    std::fs::write(&file_path, r#"{"anything": "goes"}"#).unwrap();
+
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    let uri = file_uri(file_path.to_str().unwrap());
+    client
+        .did_open(&uri, "json", 1, r#"{"anything": "goes"}"#)
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notification = client
+        .recv_notification("textDocument/publishDiagnostics")
+        .await;
+
+    let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "expected one no-schema diagnostic");
+    assert_eq!(diagnostics[0]["code"], "no-schema");
+    assert_eq!(diagnostics[0]["source"], "jvl");
+}
+
+/// strict: true in jvl.json + file with $schema → no no-schema diagnostic.
+#[tokio::test]
+async fn strict_mode_with_schema_no_extra_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("jvl.json"), r#"{"strict": true}"#).unwrap();
+
+    let schema_path = simple_schema_path();
+    let content = format!(r#"{{"$schema": "{schema_path}", "name": "app", "port": 8080}}"#);
+
+    let file_path = dir.path().join("test.json");
+    std::fs::write(&file_path, &content).unwrap();
+
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    let uri = file_uri(file_path.to_str().unwrap());
+    client.did_open(&uri, "json", 1, &content).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notification = client
+        .recv_notification("textDocument/publishDiagnostics")
+        .await;
+
+    let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    let no_schema_count = diagnostics
+        .iter()
+        .filter(|d| d["code"] == "no-schema")
+        .count();
+    assert_eq!(
+        no_schema_count, 0,
+        "expected no no-schema diagnostic when file has $schema"
+    );
+}
+
+/// strict: true but file doesn't match files globs → no diagnostic.
+#[tokio::test]
+async fn strict_mode_non_matching_file_no_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jvl.json"),
+        r#"{"strict": true, "files": ["src/**/*.json"]}"#,
+    )
+    .unwrap();
+
+    // File is at the root, not under src/, so it shouldn't match the files pattern.
+    let file_path = dir.path().join("test.json");
+    std::fs::write(&file_path, r#"{"anything": "goes"}"#).unwrap();
+
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    let uri = file_uri(file_path.to_str().unwrap());
+    client
+        .did_open(&uri, "json", 1, r#"{"anything": "goes"}"#)
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notification = client
+        .recv_notification("textDocument/publishDiagnostics")
+        .await;
+
+    let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(
+        diagnostics.len(),
+        0,
+        "expected no diagnostics for file not matching files globs"
+    );
+}
+
 /// Non-file:// URIs are handled gracefully — no crash, and any notification received
 /// should have empty diagnostics (server skips non-file URIs).
 #[tokio::test]

@@ -11,7 +11,7 @@ use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 use crate::diagnostic::{FileDiagnostic, Severity};
-use crate::discover::{self, CompiledSchemaMappings, Config};
+use crate::discover::{self, CompiledFileFilter, CompiledSchemaMappings, Config};
 use crate::parse;
 use crate::schema::{SchemaCache, SchemaSource};
 use crate::validate;
@@ -20,6 +20,15 @@ use crate::validate;
 struct CompiledConfig {
     mappings: CompiledSchemaMappings,
     project_root: PathBuf,
+    strict: bool,
+    file_filter: CompiledFileFilter,
+}
+
+/// Result of resolving config + schema for a single document.
+struct ResolvedDocument {
+    schema_source: Option<SchemaSource>,
+    strict: bool,
+    config_log: Option<String>,
 }
 
 /// LSP server backend.
@@ -130,19 +139,18 @@ impl Backend {
         let file_path_clone = file_path.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            let (schema_source, config_log) =
-                resolve_schema_for_document(&file_path_clone, &config_cache_clone);
+            let resolved = resolve_schema_for_document(&file_path_clone, &config_cache_clone);
 
             let validate_result = validate::validate_file(
                 &path_str,
                 &content_clone,
-                schema_source.as_ref(),
+                resolved.schema_source.as_ref(),
                 &schema_cache_clone,
                 false, // no_cache: always use disk cache in LSP mode
-                false, // strict: silent skip for files without schema
+                resolved.strict,
             );
 
-            (validate_result, config_log)
+            (validate_result, resolved.config_log)
         })
         .await;
 
@@ -354,16 +362,19 @@ impl LanguageServer for Backend {
 
 /// Resolve the schema source for a document by walking up to find jvl.json.
 ///
-/// Returns `(schema_source, optional_error_message)`.
-/// On config error, returns `(None, Some(error_message))` so the caller can log it.
+/// On config error, returns a `ResolvedDocument` with `config_log` set so the caller can log it.
 /// After the first successful load, results are cached by jvl.json path.
 fn resolve_schema_for_document(
     path: &Path,
     config_cache: &Mutex<HashMap<PathBuf, Arc<CompiledConfig>>>,
-) -> (Option<SchemaSource>, Option<String>) {
+) -> ResolvedDocument {
     // Find the nearest jvl.json by walking up the directory tree.
     let Some(config_path) = discover::find_config_file(path) else {
-        return (None, None);
+        return ResolvedDocument {
+            schema_source: None,
+            strict: false,
+            config_log: None,
+        };
     };
 
     // Check the cache first (fast path — no disk I/O after first load).
@@ -379,13 +390,14 @@ fn resolve_schema_for_document(
             let config = match Config::load(&config_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    return (
-                        None,
-                        Some(format!(
+                    return ResolvedDocument {
+                        schema_source: None,
+                        strict: false,
+                        config_log: Some(format!(
                             "jvl: failed to load {}: {e}",
                             config_path.display()
                         )),
-                    );
+                    };
                 }
             };
 
@@ -394,19 +406,36 @@ fn resolve_schema_for_document(
             let mappings = match discover::CompiledSchemaMappings::compile(&config) {
                 Ok(m) => m,
                 Err(e) => {
-                    return (
-                        None,
-                        Some(format!(
+                    return ResolvedDocument {
+                        schema_source: None,
+                        strict: false,
+                        config_log: Some(format!(
                             "jvl: failed to compile schema mappings from {}: {e}",
                             config_path.display()
                         )),
-                    );
+                    };
+                }
+            };
+
+            let file_filter = match CompiledFileFilter::compile(&config) {
+                Ok(f) => f,
+                Err(e) => {
+                    return ResolvedDocument {
+                        schema_source: None,
+                        strict: false,
+                        config_log: Some(format!(
+                            "jvl: failed to compile file patterns from {}: {e}",
+                            config_path.display()
+                        )),
+                    };
                 }
             };
 
             let new_compiled = Arc::new(CompiledConfig {
                 mappings,
                 project_root,
+                strict: config.strict,
+                file_filter,
             });
 
             // Use entry().or_insert() to handle concurrent cache misses gracefully
@@ -426,10 +455,20 @@ fn resolve_schema_for_document(
         })
         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
-    (
-        compiled.mappings.resolve(&relative, &compiled.project_root),
-        None,
-    )
+    // Only validate files that match the config's files patterns.
+    if !compiled.file_filter.matches(&relative) {
+        return ResolvedDocument {
+            schema_source: None,
+            strict: false,
+            config_log: None,
+        };
+    }
+
+    ResolvedDocument {
+        schema_source: compiled.mappings.resolve(&relative, &compiled.project_root),
+        strict: compiled.strict,
+        config_log: None,
+    }
 }
 
 /// Convert a byte column offset to an LSP character offset using the negotiated encoding.

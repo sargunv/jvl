@@ -401,6 +401,7 @@ fn run_check(args: CheckArgs) -> ExitCode {
     }
 
     let config = loaded_config.unwrap_or_else(Config::default_config);
+    let strict = args.strict || config.strict;
 
     // Pre-compile schema mappings once
     let compiled_mappings = match CompiledSchemaMappings::compile(&config) {
@@ -605,7 +606,7 @@ fn run_check(args: CheckArgs) -> ExitCode {
                 effective_schema.as_ref(),
                 &schema_cache,
                 args.no_cache,
-                args.strict,
+                strict,
             );
 
             let verbose_info = if verbose {
