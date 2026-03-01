@@ -170,6 +170,152 @@ async fn parse_error_produces_diagnostic() {
     );
 }
 
+/// strict: true in jvl.json + file with no schema → no-schema diagnostic emitted.
+#[tokio::test]
+async fn strict_mode_no_schema_produces_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("jvl.json"), r#"{"strict": true}"#).unwrap();
+
+    let file_path = dir.path().join("test.json");
+    std::fs::write(&file_path, r#"{"anything": "goes"}"#).unwrap();
+
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    let uri = file_uri(file_path.to_str().unwrap());
+    client
+        .did_open(&uri, "json", 1, r#"{"anything": "goes"}"#)
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notification = client
+        .recv_notification("textDocument/publishDiagnostics")
+        .await;
+
+    let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "expected one no-schema diagnostic");
+    assert_eq!(diagnostics[0]["code"], "no-schema");
+    assert_eq!(diagnostics[0]["source"], "jvl");
+}
+
+/// strict: true in jvl.json + file with $schema → no no-schema diagnostic.
+#[tokio::test]
+async fn strict_mode_with_schema_no_extra_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("jvl.json"), r#"{"strict": true}"#).unwrap();
+
+    let schema_path = simple_schema_path();
+    let content = format!(r#"{{"$schema": "{schema_path}", "name": "app", "port": 8080}}"#);
+
+    let file_path = dir.path().join("test.json");
+    std::fs::write(&file_path, &content).unwrap();
+
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    let uri = file_uri(file_path.to_str().unwrap());
+    client.did_open(&uri, "json", 1, &content).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notification = client
+        .recv_notification("textDocument/publishDiagnostics")
+        .await;
+
+    let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    let no_schema_count = diagnostics
+        .iter()
+        .filter(|d| d["code"] == "no-schema")
+        .count();
+    assert_eq!(
+        no_schema_count, 0,
+        "expected no no-schema diagnostic when file has $schema"
+    );
+}
+
+/// strict: true but file doesn't match files globs → no diagnostic.
+#[tokio::test]
+async fn strict_mode_non_matching_file_no_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("jvl.json"),
+        r#"{"strict": true, "files": ["src/**/*.json"]}"#,
+    )
+    .unwrap();
+
+    // File is at the root, not under src/, so it shouldn't match the files pattern.
+    let file_path = dir.path().join("test.json");
+    std::fs::write(&file_path, r#"{"anything": "goes"}"#).unwrap();
+
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    let uri = file_uri(file_path.to_str().unwrap());
+    client
+        .did_open(&uri, "json", 1, r#"{"anything": "goes"}"#)
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notification = client
+        .recv_notification("textDocument/publishDiagnostics")
+        .await;
+
+    let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(
+        diagnostics.len(),
+        0,
+        "expected no diagnostics for file not matching files globs"
+    );
+}
+
+/// When canonicalize fails (non-existent file), the LSP logs a fallback warning.
+#[tokio::test]
+async fn fallback_path_logs_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("jvl.json"), r#"{}"#).unwrap();
+
+    // Point at a non-existent file so std::fs::canonicalize fails,
+    // triggering the strip_prefix fallback and the warning log.
+    let file_path = dir.path().join("nonexistent.json");
+    let uri = file_uri(file_path.to_str().unwrap());
+
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    client.did_open(&uri, "json", 1, r#"{"key": "val"}"#).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Collect messages until publishDiagnostics, checking for the fallback warning.
+    let mut found_warning = false;
+    loop {
+        let msg = client.recv().await;
+        if let Some(method) = msg["method"].as_str() {
+            if method == "window/logMessage" {
+                let message = msg["params"]["message"].as_str().unwrap_or("");
+                if message.contains("could not relativize path") {
+                    assert!(
+                        message.contains("nonexistent.json"),
+                        "warning should include the document path: {message}"
+                    );
+                    assert!(
+                        message.contains("project root"),
+                        "warning should mention project root: {message}"
+                    );
+                    found_warning = true;
+                }
+            }
+            if method == "textDocument/publishDiagnostics" {
+                break;
+            }
+        }
+    }
+
+    assert!(
+        found_warning,
+        "expected a window/logMessage warning about path relativization fallback"
+    );
+}
+
 /// Schema load error points at the $schema value span, not (0,0).
 #[tokio::test]
 async fn schema_load_error_points_at_schema_value() {
