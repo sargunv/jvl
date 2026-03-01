@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use jsonschema::paths::LocationSegment;
+
 use crate::diagnostic::{FileDiagnostic, FileResult, Severity, SourceLocation, Warning};
 use crate::parse::{self, ParsedFile};
 use crate::schema::{CacheOutcome, SchemaCache, SchemaError, SchemaSource};
@@ -117,16 +119,42 @@ pub fn validate_file(
                     SchemaError::CompileError(_) => "compile",
                     _ => "load",
                 };
+                // Point at the $schema value span when the schema came from the
+                // document's $schema field (not from --schema flag or jvl.json mapping).
+                let span = if schema_source.is_none() {
+                    parsed.resolve_pointer(std::iter::once(LocationSegment::Property(
+                        Cow::Borrowed("$schema"),
+                    )))
+                } else {
+                    None
+                };
+                let location = span.as_ref().map(|r| {
+                    let (line, col) = parsed.offset_to_line_col(r.start);
+                    SourceLocation {
+                        line,
+                        column: col,
+                        offset: r.start,
+                        length: r.len(),
+                    }
+                });
+                let label = span.as_ref().map(|_| "schema referenced here".into());
+                // When the span points at the $schema value, the path is
+                // already visible in the source snippet — just show the reason.
+                let message = if span.is_some() {
+                    e.reason().to_string()
+                } else {
+                    e.to_string()
+                };
                 return (
                     FileResult::tool_error(
                         file_path,
                         vec![FileDiagnostic {
                             code: format!("schema({category})"),
-                            message: e.to_string(),
+                            message,
                             severity: Severity::Error,
-                            span: None,
-                            location: None,
-                            label: None,
+                            span,
+                            location,
+                            label,
                             help: None,
                             schema_path: None,
                         }],

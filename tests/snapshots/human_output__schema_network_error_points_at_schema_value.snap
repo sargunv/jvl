@@ -1,0 +1,17 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(compile): Resource 'http://0.0.0.0:1/nonexistent' is not present in
+  │ a registry and retrieving it failed: Failed to fetch schema from
+  │ 'http://0.0.0.0:1/nonexistent': error sending request for url
+  │ (http://0.0.0.0:1/nonexistent)
+   ╭─[[fixtures]/schema-network-error.json:1:14]
+ 1 │ { "$schema": "./bad-ref-schema.json", "name": "test" }
+   ·              ───────────┬───────────
+   ·                         ╰── schema referenced here
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])
