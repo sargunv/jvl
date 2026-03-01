@@ -764,6 +764,31 @@ pub enum ValueSuggestion {
     Null,
 }
 
+impl ValueSuggestion {
+    /// Return a dedup key that uniquely identifies this suggestion.
+    ///
+    /// For string-valued enums/consts (the dominant case) this avoids the
+    /// full JSON-serialization overhead of `serde_json::Value::Display` by
+    /// using the raw `&str` directly.
+    fn dedup_key(&self) -> String {
+        match self {
+            Self::Const(v) | Self::Enum(v) => {
+                let prefix = if matches!(self, Self::Const(_)) {
+                    "c:"
+                } else {
+                    "e:"
+                };
+                match v.as_str() {
+                    Some(s) => format!("{prefix}{s}"),
+                    None => format!("{prefix}{v}"),
+                }
+            }
+            Self::Boolean => "b".into(),
+            Self::Null => "n".into(),
+        }
+    }
+}
+
 /// Collect all completable properties from a schema at the given pointer path.
 ///
 /// Follows `$ref` and merges `allOf`/`oneOf`/`anyOf` branches. Returns an empty
@@ -944,9 +969,9 @@ fn collect_values_from(
 
     // Check for const (local early return — only this branch).
     if let Some(const_val) = schema.get("const") {
-        let key = format!("c:{}", const_val);
-        if seen.insert(key) {
-            suggestions.push(ValueSuggestion::Const(const_val.clone()));
+        let suggestion = ValueSuggestion::Const(const_val.clone());
+        if seen.insert(suggestion.dedup_key()) {
+            suggestions.push(suggestion);
         }
         return;
     }
@@ -954,9 +979,9 @@ fn collect_values_from(
     // Check for enum (local early return — only this branch).
     if let Some(enum_vals) = schema.get("enum").and_then(|v| v.as_array()) {
         for val in enum_vals {
-            let key = format!("e:{}", val);
-            if seen.insert(key) {
-                suggestions.push(ValueSuggestion::Enum(val.clone()));
+            let suggestion = ValueSuggestion::Enum(val.clone());
+            if seen.insert(suggestion.dedup_key()) {
+                suggestions.push(suggestion);
             }
         }
         return;
@@ -971,12 +996,12 @@ fn collect_values_from(
     for t in &types {
         match *t {
             "boolean" => {
-                if seen.insert("b".to_string()) {
+                if seen.insert(ValueSuggestion::Boolean.dedup_key()) {
                     suggestions.push(ValueSuggestion::Boolean);
                 }
             }
             "null" => {
-                if seen.insert("n".to_string()) {
+                if seen.insert(ValueSuggestion::Null.dedup_key()) {
                     suggestions.push(ValueSuggestion::Null);
                 }
             }
