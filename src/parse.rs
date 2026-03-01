@@ -455,40 +455,22 @@ pub fn completion_context(source: &str, byte_offset: usize) -> Option<Completion
     // Find the innermost object level (skip any array levels on top).
     let innermost_object = stack.iter().rposition(|l| l.is_object);
 
-    if in_string {
-        // Cursor is inside a string.
-        let obj_idx = innermost_object?;
-        let level = &stack[obj_idx];
-        let pointer = build_pointer(&stack[..=obj_idx]);
-        if level.after_colon {
-            let property_name = level
-                .last_key_content
-                .map(|(s, e)| source[s..e].to_string())
-                .unwrap_or_default();
-            Some(CompletionContext::PropertyValue {
-                property_name,
-                pointer,
-            })
-        } else {
-            Some(CompletionContext::PropertyKey { pointer })
-        }
+    // Whether the cursor is inside a string or on whitespace/structural tokens,
+    // the context determination is the same: check the innermost object level.
+    let obj_idx = innermost_object?;
+    let level = &stack[obj_idx];
+    let pointer = build_pointer(&stack[..=obj_idx]);
+    if level.after_colon {
+        let property_name = level
+            .last_key_content
+            .map(|(s, e)| source[s..e].to_string())
+            .unwrap_or_default();
+        Some(CompletionContext::PropertyValue {
+            property_name,
+            pointer,
+        })
     } else {
-        // Cursor is on whitespace or structural tokens.
-        let obj_idx = innermost_object?;
-        let level = &stack[obj_idx];
-        let pointer = build_pointer(&stack[..=obj_idx]);
-        if level.after_colon {
-            let property_name = level
-                .last_key_content
-                .map(|(s, e)| source[s..e].to_string())
-                .unwrap_or_default();
-            Some(CompletionContext::PropertyValue {
-                property_name,
-                pointer,
-            })
-        } else {
-            Some(CompletionContext::PropertyKey { pointer })
-        }
+        Some(CompletionContext::PropertyKey { pointer })
     }
 }
 

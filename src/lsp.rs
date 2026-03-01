@@ -911,6 +911,14 @@ fn escape_glob_metacharacters(s: &str) -> String {
     escaped
 }
 
+/// Escape LSP snippet metacharacters (`$`, `}`, `\`) in a string so it is
+/// treated as literal text inside an `InsertTextFormat::Snippet`.
+fn escape_snippet(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('$', "\\$")
+        .replace('}', "\\}")
+}
+
 /// Collect existing property keys from a `serde_json::Value` at a given pointer path.
 fn existing_keys(value: &serde_json::Value, pointer: &[String]) -> HashSet<String> {
     let mut current = value;
@@ -967,7 +975,11 @@ fn build_property_items(
             let (insert_text, insert_text_format) = if snippet {
                 let value_snippet = snippet_for_type(p.schema_type.as_deref());
                 (
-                    Some(format!("\"{}\": {}", p.name, value_snippet)),
+                    Some(format!(
+                        "\"{}\": {}",
+                        escape_snippet(&p.name),
+                        value_snippet
+                    )),
                     Some(InsertTextFormat::SNIPPET),
                 )
             } else {
@@ -1002,18 +1014,20 @@ fn build_value_items(values: &[schema::ValueSuggestion]) -> Vec<CompletionItem> 
         .iter()
         .flat_map(|v| match v {
             schema::ValueSuggestion::Enum(val) => {
+                let formatted = format_json_value(val);
                 vec![CompletionItem {
-                    label: format_json_value(val),
+                    insert_text: Some(formatted.clone()),
+                    label: formatted,
                     kind: Some(CompletionItemKind::ENUM_MEMBER),
-                    insert_text: Some(format_json_value(val)),
                     ..Default::default()
                 }]
             }
             schema::ValueSuggestion::Const(val) => {
+                let formatted = format_json_value(val);
                 vec![CompletionItem {
-                    label: format_json_value(val),
+                    insert_text: Some(formatted.clone()),
+                    label: formatted,
                     kind: Some(CompletionItemKind::VALUE),
-                    insert_text: Some(format_json_value(val)),
                     ..Default::default()
                 }]
             }
@@ -1044,10 +1058,7 @@ fn build_value_items(values: &[schema::ValueSuggestion]) -> Vec<CompletionItem> 
 
 /// Format a serde_json::Value as a JSON string suitable for insertion.
 fn format_json_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => format!("\"{s}\""),
-        other => other.to_string(),
-    }
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 /// Return a snippet placeholder appropriate for the given JSON schema type.

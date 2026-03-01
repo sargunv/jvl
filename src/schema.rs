@@ -926,9 +926,7 @@ fn resolve_subschema<'a>(
     // Try allOf branches.
     if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
         for branch in all_of {
-            if let Some(result) =
-                resolve_subschema(root, branch, pointer, &mut visited.clone(), depth + 1)
-            {
+            if let Some(result) = resolve_subschema(root, branch, pointer, visited, depth + 1) {
                 return Some(result);
             }
         }
