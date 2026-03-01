@@ -35,7 +35,12 @@
         },
         "verbose": { "type": "boolean" }
       }
-    }
+    },
+    "nullable_flag": { "oneOf": [{ "type": "boolean" }, { "type": "null" }] },
+    "multi_enum": {
+      "anyOf": [{ "enum": ["fast", "slow"] }, { "enum": ["medium"] }]
+    },
+    "typed_nullable": { "type": ["string", "null"] }
   },
   "required": ["name"]
 }
