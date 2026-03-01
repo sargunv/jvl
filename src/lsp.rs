@@ -224,28 +224,23 @@ impl Backend {
                 .await;
         }
 
-        // 7. Post-validation version guard: discard if a newer edit arrived during validation
-        //    or the document was closed (None from the map → discard, not publish).
-        let still_current = {
-            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-            docs.get(&uri)
-                .map(|state| state.version == version)
-                .unwrap_or(false)
-        };
-
-        if !still_current {
-            return;
-        }
-
-        // 8. Update stale value cache if the parse succeeded.
-        if let Some(value) = parsed_value
-            && let Some(state) = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&uri)
+        // 7. Post-validation version guard + update stale value cache.
+        //    Done in a single lock acquisition to avoid a TOCTOU race where a new
+        //    edit could arrive between the version check and the cache update.
         {
-            state.last_good_value = Some(value);
+            let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            let still_current = docs
+                .get(&uri)
+                .map(|state| state.version == version)
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+            if let Some(value) = parsed_value
+                && let Some(state) = docs.get_mut(&uri)
+            {
+                state.last_good_value = Some(value);
+            }
         }
 
         // 9. Convert and publish diagnostics.
