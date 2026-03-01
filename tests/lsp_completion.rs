@@ -383,6 +383,93 @@ async fn completion_text_edit_covers_auto_paired_quotes() {
     );
 }
 
+/// oneOf value completion combines suggestions from all branches.
+#[tokio::test]
+async fn completion_oneof_values() {
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    // {"$schema": "...", "nullable_flag": null}
+    let content = doc_with_schema(r#""nullable_flag": null"#);
+    let uri = doc_uri();
+    open_and_wait(&mut client, &uri, &content).await;
+
+    let idx = content.find("\"nullable_flag\": ").unwrap() + "\"nullable_flag\": ".len();
+    let cursor_col = idx as u32;
+    let result = client.completion(&uri, 0, cursor_col).await;
+
+    let names = labels(&result);
+    assert!(
+        names.contains(&"true".to_string()),
+        "expected 'true' in oneOf completions, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"false".to_string()),
+        "expected 'false' in oneOf completions, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"null".to_string()),
+        "expected 'null' in oneOf completions, got: {names:?}"
+    );
+}
+
+/// anyOf enum value completion merges enums from all branches.
+#[tokio::test]
+async fn completion_anyof_enum_values() {
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    // {"$schema": "...", "multi_enum": null}
+    let content = doc_with_schema(r#""multi_enum": null"#);
+    let uri = doc_uri();
+    open_and_wait(&mut client, &uri, &content).await;
+
+    let idx = content.find("\"multi_enum\": ").unwrap() + "\"multi_enum\": ".len();
+    let cursor_col = idx as u32;
+    let result = client.completion(&uri, 0, cursor_col).await;
+
+    let names = labels(&result);
+    assert!(
+        names.contains(&r#""fast""#.to_string()),
+        "expected '\"fast\"' in anyOf enum completions, got: {names:?}"
+    );
+    assert!(
+        names.contains(&r#""slow""#.to_string()),
+        "expected '\"slow\"' in anyOf enum completions, got: {names:?}"
+    );
+    assert!(
+        names.contains(&r#""medium""#.to_string()),
+        "expected '\"medium\"' in anyOf enum completions, got: {names:?}"
+    );
+}
+
+/// type-as-array completion suggests null for ["string", "null"].
+#[tokio::test]
+async fn completion_type_array_values() {
+    let mut client = TestClient::new();
+    client.initialize().await;
+
+    // {"$schema": "...", "typed_nullable": null}
+    let content = doc_with_schema(r#""typed_nullable": null"#);
+    let uri = doc_uri();
+    open_and_wait(&mut client, &uri, &content).await;
+
+    let idx = content.find("\"typed_nullable\": ").unwrap() + "\"typed_nullable\": ".len();
+    let cursor_col = idx as u32;
+    let result = client.completion(&uri, 0, cursor_col).await;
+
+    let names = labels(&result);
+    assert!(
+        names.contains(&"null".to_string()),
+        "expected 'null' in type array completions, got: {names:?}"
+    );
+    // string type should not produce suggestions
+    assert!(
+        !names.contains(&"true".to_string()),
+        "should not contain 'true' for string|null type"
+    );
+}
+
 /// Completion includes documentation from schema description.
 #[tokio::test]
 async fn completion_includes_documentation() {
