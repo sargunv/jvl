@@ -234,6 +234,36 @@ impl Backend {
         self.update_schema_watchers().await;
     }
 
+    /// Snapshot the current document text for the given URI.
+    fn snapshot_document(&self, uri: &Uri) -> Option<Arc<String>> {
+        let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
+        docs.get(uri).map(|(_, c)| c.clone())
+    }
+
+    /// Resolve the schema source for a document URI, compile it, and return
+    /// the raw schema `serde_json::Value`. Returns `None` if the URI is not a
+    /// file:// URI, no schema is configured, or the schema fails to compile.
+    fn resolve_schema_value(
+        &self,
+        uri: &Uri,
+        parsed_value: &serde_json::Value,
+    ) -> Option<Arc<serde_json::Value>> {
+        let file_path = uri.to_file_path().map(Cow::into_owned)?;
+        let resolved = resolve_schema_for_document(&file_path, &self.config_cache);
+
+        let schema_source = resolved
+            .schema_source
+            .or_else(|| schema::resolve_schema_from_value(parsed_value, &file_path))?;
+
+        match self
+            .schema_cache
+            .get_or_compile_with_value(&schema_source, false)
+        {
+            Ok(Some(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Register file watchers for newly discovered schema file paths.
     ///
     /// Queries the schema cache for all `SchemaSource::File` entries and
@@ -425,12 +455,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // 1. Snapshot document text from document_map.
-        let content = {
-            let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.get(&uri).map(|(_, c)| c.clone())
-        };
-        let Some(content) = content else {
+        // 1. Snapshot document text.
+        let Some(content) = self.snapshot_document(&uri) else {
             return Ok(None);
         };
 
@@ -443,54 +469,27 @@ impl LanguageServer for Backend {
         // 3. Convert LSP position to byte offset.
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
         let line_starts = parse::compute_line_starts(&content);
-        let line_idx = position.line as usize;
-        let line_start = match line_starts.get(line_idx) {
-            Some(&start) => start,
-            None => return Ok(None),
+        let Some(byte_offset) = lsp_position_to_byte_offset(&content, &line_starts, position, utf8)
+        else {
+            return Ok(None);
         };
-        let line_end = line_starts
-            .get(line_idx + 1)
-            .copied()
-            .unwrap_or(content.len());
-        let line_text = &content[line_start..line_end];
-        let byte_col = lsp_col_to_byte(line_text, position.character, utf8);
-        let byte_offset = line_start + byte_col;
 
         // 4. Find JSON pointer at byte offset.
         let Some((pointer, node_range)) = parse::offset_to_pointer(&parsed.ast, byte_offset) else {
             return Ok(None);
         };
 
-        // 5. Resolve schema source for this document.
-        let Some(file_path) = uri.to_file_path().map(Cow::into_owned) else {
+        // 5. Resolve schema value for this document.
+        let Some(schema_value) = self.resolve_schema_value(&uri, &parsed.value) else {
             return Ok(None);
         };
-        let resolved = resolve_schema_for_document(&file_path, &self.config_cache);
 
-        // If no schema source from config, try the $schema field in the document itself.
-        let schema_source = match resolved
-            .schema_source
-            .or_else(|| schema::resolve_schema_from_value(&parsed.value, &file_path))
-        {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        // 6. Ensure schema is compiled and get the raw schema value.
-        let schema_value = match self
-            .schema_cache
-            .get_or_compile_with_value(&schema_source, false)
-        {
-            Ok(Some(v)) => v,
-            _ => return Ok(None),
-        };
-
-        // 7. Look up hover content from schema annotations.
+        // 6. Look up hover content from schema annotations.
         let Some(hover_content) = schema::lookup_hover_content(&schema_value, &pointer) else {
             return Ok(None);
         };
 
-        // 8. Convert node_range back to LSP Range.
+        // 7. Convert node_range back to LSP Range.
         let start_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.start, utf8);
         let end_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.end, utf8);
 
@@ -664,6 +663,26 @@ fn resolve_schema_for_document(
         strict: compiled.strict,
         config_log: fallback_warning,
     }
+}
+
+/// Convert an LSP `Position` to a byte offset in `source`.
+///
+/// Returns `None` if the line index is out of range.
+fn lsp_position_to_byte_offset(
+    source: &str,
+    line_starts: &[usize],
+    position: Position,
+    utf8: bool,
+) -> Option<usize> {
+    let line_idx = position.line as usize;
+    let line_start = *line_starts.get(line_idx)?;
+    let line_end = line_starts
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(source.len());
+    let line_text = &source[line_start..line_end];
+    let byte_col = lsp_col_to_byte(line_text, position.character, utf8);
+    Some(line_start + byte_col)
 }
 
 /// Convert a byte offset in `source` to an LSP `Position`.
