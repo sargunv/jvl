@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "$defs": {
+    "Address": {
+      "type": "object",
+      "properties": {
+        "street": {
+          "title": "Street",
+          "description": "Street name",
+          "type": "string"
+        },
+        "city": { "title": "City", "type": "string" }
+      },
+      "required": ["street"]
+    }
+  },
+  "properties": {
+    "name": {
+      "title": "Name",
+      "description": "The user's full name",
+      "type": "string"
+    },
+    "age": { "type": "number" },
+    "enabled": { "type": "boolean" },
+    "mode": { "enum": ["dark", "light", "auto"] },
+    "version": { "const": 2 },
+    "address": { "$ref": "#/$defs/Address" },
+    "settings": {
+      "type": "object",
+      "properties": {
+        "theme": {
+          "title": "Theme",
+          "description": "UI color theme",
+          "type": "string"
+        },
+        "verbose": { "type": "boolean" }
+      }
+    }
+  },
+  "required": ["name"]
+}

@@ -12,6 +12,7 @@
     "promise",
     "vitest"
   ],
+  "options": { "typeAware": true, "typeCheck": true },
   "categories": { "correctness": "error", "perf": "error" },
   "rules": {
     "no-console": "error",

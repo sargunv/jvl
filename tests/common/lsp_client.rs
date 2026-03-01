@@ -206,6 +206,30 @@ impl TestClient {
         response["result"].clone()
     }
 
+    /// Send `textDocument/completion` request and return the result.
+    pub async fn completion(&mut self, uri: &str, line: u32, character: u32) -> serde_json::Value {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }
+        }))
+        .await;
+
+        let response = loop {
+            let msg = self.recv().await;
+            if msg.get("id") == Some(&serde_json::json!(id)) && msg.get("method").is_none() {
+                break msg;
+            }
+        };
+
+        response["result"].clone()
+    }
+
     /// Send `shutdown` request.
     pub async fn shutdown(&mut self) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
