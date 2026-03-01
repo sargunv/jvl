@@ -585,20 +585,19 @@ impl LanguageServer for Backend {
             .get(&uri)
             .and_then(|state| state.last_good_parse.clone());
 
-        let parsed_value =
-            if let Some((ref cached_content, ref cached_value)) = cached
-                && Arc::ptr_eq(cached_content, &content)
-            {
-                cached_value.clone()
-            } else {
-                match parse::parse_jsonc(&content) {
-                    Ok(p) => Arc::new(p.value),
-                    Err(_) => match cached {
-                        Some((_, v)) => v,
-                        None => return Ok(None),
-                    },
-                }
-            };
+        let parsed_value = if let Some((ref cached_content, ref cached_value)) = cached
+            && Arc::ptr_eq(cached_content, &content)
+        {
+            cached_value.clone()
+        } else {
+            match parse::parse_jsonc(&content) {
+                Ok(p) => Arc::new(p.value),
+                Err(_) => match cached {
+                    Some((_, v)) => v,
+                    None => return Ok(None),
+                },
+            }
+        };
 
         // 3. Convert LSP position to byte offset.
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
