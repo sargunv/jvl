@@ -70,6 +70,8 @@ pub struct Backend {
     next_reg_id: Arc<AtomicU64>,
     /// True if the client supports Markdown in hover content.
     hover_markdown: Arc<AtomicBool>,
+    /// True if the client supports snippet syntax in completion insertText.
+    snippet_support: Arc<AtomicBool>,
     /// Last successfully parsed `serde_json::Value` per document URI.
     /// Used as a fallback when the current document text is malformed.
     last_good_value: Arc<Mutex<HashMap<Uri, Arc<serde_json::Value>>>>,
@@ -93,6 +95,7 @@ impl Backend {
             watched_schema_paths: Arc::new(Mutex::new(HashSet::new())),
             next_reg_id: Arc::new(AtomicU64::new(0)),
             hover_markdown: Arc::new(AtomicBool::new(true)),
+            snippet_support: Arc::new(AtomicBool::new(false)),
             last_good_value: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -358,6 +361,15 @@ impl LanguageServer for Backend {
                 .store(formats.contains(&MarkupKind::Markdown), Ordering::Relaxed);
         }
 
+        // Check if client supports snippet syntax in completion insertText.
+        if let Some(text_doc) = &params.capabilities.text_document
+            && let Some(completion_caps) = &text_doc.completion
+            && let Some(item_caps) = &completion_caps.completion_item
+            && item_caps.snippet_support == Some(true)
+        {
+            self.snippet_support.store(true, Ordering::Relaxed);
+        }
+
         let position_encoding = if utf8 {
             PositionEncodingKind::UTF8
         } else {
@@ -375,6 +387,11 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec!["\"".to_string()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         })
@@ -529,6 +546,75 @@ impl LanguageServer for Backend {
             }),
             range: Some(Range::new(start_pos, end_pos)),
         }))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        // 1. Snapshot document text.
+        let Some(content) = self.snapshot_document(&uri) else {
+            return Ok(None);
+        };
+
+        // 2. Try parsing current text; fall back to stale cached value.
+        let parsed_value = match parse::parse_jsonc(&content) {
+            Ok(p) => Arc::new(p.value),
+            Err(_) => {
+                let stale = self
+                    .last_good_value
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&uri)
+                    .cloned();
+                match stale {
+                    Some(v) => v,
+                    None => return Ok(None),
+                }
+            }
+        };
+
+        // 3. Convert LSP position to byte offset.
+        let utf8 = self.utf8_positions.load(Ordering::Relaxed);
+        let line_starts = parse::compute_line_starts(&content);
+        let Some(byte_offset) = lsp_position_to_byte_offset(&content, &line_starts, position, utf8)
+        else {
+            return Ok(None);
+        };
+
+        // 4. Determine completion context via text scanning.
+        let Some(ctx) = parse::completion_context(&content, byte_offset) else {
+            return Ok(None);
+        };
+
+        // 5. Resolve schema value for this document.
+        let Some(schema_value) = self.resolve_schema_value(&uri, &parsed_value) else {
+            return Ok(None);
+        };
+
+        // 6. Build completion items based on context.
+        let snippet = self.snippet_support.load(Ordering::Relaxed);
+        let markdown = self.hover_markdown.load(Ordering::Relaxed);
+
+        let items = match &ctx {
+            parse::CompletionContext::PropertyKey { pointer } => {
+                let props = schema::collect_properties(&schema_value, pointer);
+                let existing = existing_keys(&parsed_value, pointer);
+                build_property_items(&props, &existing, snippet, markdown)
+            }
+            parse::CompletionContext::PropertyValue {
+                property_name,
+                pointer,
+            } => {
+                let values = schema::collect_values(&schema_value, pointer, property_name);
+                build_value_items(&values)
+            }
+        };
+
+        Ok(Some(CompletionResponse::List(CompletionList {
+            is_incomplete: false,
+            items,
+        })))
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -823,6 +909,158 @@ fn escape_glob_metacharacters(s: &str) -> String {
         escaped.push(c);
     }
     escaped
+}
+
+/// Collect existing property keys from a `serde_json::Value` at a given pointer path.
+fn existing_keys(value: &serde_json::Value, pointer: &[String]) -> HashSet<String> {
+    let mut current = value;
+    for segment in pointer {
+        current = match current.get(segment.as_str()) {
+            Some(v) => v,
+            None => return HashSet::new(),
+        };
+    }
+    current
+        .as_object()
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Build `CompletionItem` list from schema property info.
+fn build_property_items(
+    props: &[schema::PropertyInfo],
+    existing: &HashSet<String>,
+    snippet: bool,
+    markdown: bool,
+) -> Vec<CompletionItem> {
+    props
+        .iter()
+        .filter(|p| !existing.contains(&p.name))
+        .map(|p| {
+            let detail = {
+                let type_str = p.schema_type.as_deref().unwrap_or("any");
+                if p.required {
+                    Some(format!("{type_str} (required)"))
+                } else {
+                    Some(type_str.to_string())
+                }
+            };
+
+            let documentation = p.description.as_ref().map(|d| {
+                let kind = if markdown {
+                    MarkupKind::Markdown
+                } else {
+                    MarkupKind::PlainText
+                };
+                Documentation::MarkupContent(MarkupContent {
+                    kind,
+                    value: d.clone(),
+                })
+            });
+
+            let sort_text = if p.required {
+                Some(format!("0_{}", p.name))
+            } else {
+                Some(format!("1_{}", p.name))
+            };
+
+            let (insert_text, insert_text_format) = if snippet {
+                let value_snippet = snippet_for_type(p.schema_type.as_deref());
+                (
+                    Some(format!("\"{}\": {}", p.name, value_snippet)),
+                    Some(InsertTextFormat::SNIPPET),
+                )
+            } else {
+                (
+                    Some(format!("\"{}\": ", p.name)),
+                    Some(InsertTextFormat::PLAIN_TEXT),
+                )
+            };
+
+            // `filter_text` lets the client match against the bare property name
+            // even though `insert_text` contains quotes and the value placeholder.
+            let filter_text = Some(p.name.clone());
+
+            CompletionItem {
+                label: p.name.clone(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail,
+                documentation,
+                sort_text,
+                filter_text,
+                insert_text,
+                insert_text_format,
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Build `CompletionItem` list from schema value suggestions.
+fn build_value_items(values: &[schema::ValueSuggestion]) -> Vec<CompletionItem> {
+    values
+        .iter()
+        .flat_map(|v| match v {
+            schema::ValueSuggestion::Enum(val) => {
+                vec![CompletionItem {
+                    label: format_json_value(val),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    insert_text: Some(format_json_value(val)),
+                    ..Default::default()
+                }]
+            }
+            schema::ValueSuggestion::Const(val) => {
+                vec![CompletionItem {
+                    label: format_json_value(val),
+                    kind: Some(CompletionItemKind::VALUE),
+                    insert_text: Some(format_json_value(val)),
+                    ..Default::default()
+                }]
+            }
+            schema::ValueSuggestion::Boolean => {
+                vec![
+                    CompletionItem {
+                        label: "true".to_string(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        ..Default::default()
+                    },
+                    CompletionItem {
+                        label: "false".to_string(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        ..Default::default()
+                    },
+                ]
+            }
+            schema::ValueSuggestion::Null => {
+                vec![CompletionItem {
+                    label: "null".to_string(),
+                    kind: Some(CompletionItemKind::VALUE),
+                    ..Default::default()
+                }]
+            }
+        })
+        .collect()
+}
+
+/// Format a serde_json::Value as a JSON string suitable for insertion.
+fn format_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => format!("\"{s}\""),
+        other => other.to_string(),
+    }
+}
+
+/// Return a snippet placeholder appropriate for the given JSON schema type.
+fn snippet_for_type(schema_type: Option<&str>) -> &'static str {
+    match schema_type {
+        Some("string") => "\"$1\"",
+        Some("number") | Some("integer") => "${1:0}",
+        Some("boolean") => "${1:false}",
+        Some("object") => "{$1}",
+        Some("array") => "[$1]",
+        Some("null") => "null",
+        _ => "$0",
+    }
 }
 
 /// Start the LSP server over stdio.
