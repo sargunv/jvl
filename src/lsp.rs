@@ -571,13 +571,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        // 1. Snapshot document text.
+        // 1. Snapshot document text + parse cache (quick lock, stays on async thread).
         let Some(content) = self.snapshot_document(&uri) else {
             return Ok(None);
         };
-
-        // 2. Check the parse cache; if the content hasn't changed since the last
-        //    successful parse, skip `parse_jsonc` entirely.
         let cached = self
             .documents
             .lock()
@@ -585,80 +582,101 @@ impl LanguageServer for Backend {
             .get(&uri)
             .and_then(|state| state.last_good_parse.clone());
 
-        let parsed_value = if let Some((ref cached_content, ref cached_value)) = cached
-            && Arc::ptr_eq(cached_content, &content)
-        {
-            cached_value.clone()
-        } else {
-            match parse::parse_jsonc(&content) {
-                Ok(p) => Arc::new(p.value),
-                Err(_) => match cached {
-                    Some((_, v)) => v,
-                    None => return Ok(None),
-                },
-            }
-        };
-
-        // 3. Convert LSP position to byte offset.
+        // 2. Clone shared state needed inside spawn_blocking.
+        let config_cache = Arc::clone(&self.config_cache);
+        let schema_cache = Arc::clone(&self.schema_cache);
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
-        let line_starts = parse::compute_line_starts(&content);
-        let Some(byte_offset) = lsp_position_to_byte_offset(&content, &line_starts, position, utf8)
-        else {
-            return Ok(None);
-        };
-
-        // 4. Determine completion context via text scanning.
-        let Some(ctx) = parse::completion_context(&content, byte_offset) else {
-            return Ok(None);
-        };
-
-        // 5. Resolve schema value for this document.
-        let Some(schema_value) = self.resolve_schema_value(&uri, &parsed_value) else {
-            return Ok(None);
-        };
-
-        // 6. Compute the replacement range for text_edit.
-        //    replace_start comes from completion_context (opening quote if inside
-        //    a string, otherwise the cursor position).  replace_end extends past
-        //    a closing quote at the cursor when the editor auto-paired it.
-        let replace_start = match &ctx {
-            parse::CompletionContext::PropertyKey { replace_start, .. }
-            | parse::CompletionContext::PropertyValue { replace_start, .. } => *replace_start,
-        };
-        let replace_end = if content.as_bytes().get(byte_offset) == Some(&b'"') {
-            byte_offset + 1
-        } else {
-            byte_offset
-        };
-        let replace_range = Range::new(
-            byte_offset_to_lsp_position(&content, &line_starts, replace_start, utf8),
-            byte_offset_to_lsp_position(&content, &line_starts, replace_end, utf8),
-        );
-
-        // 7. Build completion items based on context.
         let snippet = self.snippet_support.load(Ordering::Relaxed);
         let markdown = self.hover_markdown.load(Ordering::Relaxed);
+        let uri_clone = uri.clone();
 
-        let items = match &ctx {
-            parse::CompletionContext::PropertyKey { pointer, .. } => {
-                let props = schema::collect_properties(&schema_value, pointer);
-                let existing = existing_keys(&parsed_value, pointer);
-                build_property_items(&props, &existing, snippet, markdown, replace_range)
-            }
-            parse::CompletionContext::PropertyValue {
-                property_name,
-                pointer,
-                ..
-            } => {
-                let values = schema::collect_values(&schema_value, pointer, property_name);
-                build_value_items(&values, replace_range)
-            }
-        };
+        // 3. All blocking work (parsing, schema resolution, completion building)
+        //    in spawn_blocking to avoid blocking the tokio runtime.
+        let result = tokio::task::spawn_blocking(move || {
+            // 3a. Resolve parsed value from cache or by parsing.
+            let parsed_value = if let Some((ref cached_content, ref cached_value)) = cached
+                && Arc::ptr_eq(cached_content, &content)
+            {
+                cached_value.clone()
+            } else {
+                match parse::parse_jsonc(&content) {
+                    Ok(p) => Arc::new(p.value),
+                    Err(_) => match cached {
+                        Some((_, v)) => v,
+                        None => return None,
+                    },
+                }
+            };
 
-        Ok(Some(CompletionResponse::List(CompletionList {
-            is_incomplete: false,
-            items,
-        })))
+            // 3b. Convert LSP position to byte offset.
+            let line_starts = parse::compute_line_starts(&content);
+            let byte_offset = lsp_position_to_byte_offset(&content, &line_starts, position, utf8)?;
+
+            // 3c. Determine completion context via text scanning.
+            let ctx = parse::completion_context(&content, byte_offset)?;
+
+            // 3d. Resolve schema value for this document.
+            let file_path = uri_clone.to_file_path().map(Cow::into_owned)?;
+            let resolved = resolve_schema_for_document(&file_path, &config_cache);
+            let schema_source = resolved
+                .schema_source
+                .or_else(|| schema::resolve_schema_from_value(&parsed_value, &file_path))?;
+            let schema_value = match schema_cache.get_or_compile_with_value(&schema_source, false) {
+                Ok(Some(v)) => v,
+                _ => return None,
+            };
+
+            // 3e. Compute the replacement range for text_edit.
+            let replace_start = match &ctx {
+                parse::CompletionContext::PropertyKey { replace_start, .. }
+                | parse::CompletionContext::PropertyValue { replace_start, .. } => *replace_start,
+            };
+            let replace_end = if content.as_bytes().get(byte_offset) == Some(&b'"') {
+                byte_offset + 1
+            } else {
+                byte_offset
+            };
+            let replace_range = Range::new(
+                byte_offset_to_lsp_position(&content, &line_starts, replace_start, utf8),
+                byte_offset_to_lsp_position(&content, &line_starts, replace_end, utf8),
+            );
+
+            // 3f. Build completion items based on context.
+            let items = match &ctx {
+                parse::CompletionContext::PropertyKey { pointer, .. } => {
+                    let props = schema::collect_properties(&schema_value, pointer);
+                    let existing = existing_keys(&parsed_value, pointer);
+                    build_property_items(&props, &existing, snippet, markdown, replace_range)
+                }
+                parse::CompletionContext::PropertyValue {
+                    property_name,
+                    pointer,
+                    ..
+                } => {
+                    let values = schema::collect_values(&schema_value, pointer, property_name);
+                    build_value_items(&values, replace_range)
+                }
+            };
+
+            Some(CompletionResponse::List(CompletionList {
+                is_incomplete: false,
+                items,
+            }))
+        })
+        .await;
+
+        match result {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("jvl: completion task panicked: {e}"),
+                    )
+                    .await;
+                Ok(None)
+            }
+        }
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
