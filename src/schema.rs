@@ -749,7 +749,7 @@ pub struct PropertyInfo {
 }
 
 /// Possible value suggestions for a property.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ValueSuggestion {
     /// A value from a schema `enum` array.
     Enum(serde_json::Value),
@@ -763,8 +763,9 @@ pub enum ValueSuggestion {
 
 /// Collect all completable properties from a schema at the given pointer path.
 ///
-/// Follows `$ref` and merges `allOf` branches. Returns an empty vec if the
-/// resolved subschema is not an object schema or the pointer cannot be resolved.
+/// Follows `$ref` and merges `allOf`/`oneOf`/`anyOf` branches. Returns an empty
+/// vec if the resolved subschema is not an object schema or the pointer cannot
+/// be resolved.
 pub fn collect_properties(root: &serde_json::Value, pointer: &[String]) -> Vec<PropertyInfo> {
     let mut visited = HashSet::new();
     let Some(subschema) = resolve_subschema(root, root, pointer, &mut visited, 0) else {
@@ -777,7 +778,7 @@ pub fn collect_properties(root: &serde_json::Value, pointer: &[String]) -> Vec<P
     props
 }
 
-/// Recursively collect properties from a schema, merging allOf branches.
+/// Recursively collect properties from a schema, merging allOf/oneOf/anyOf branches.
 fn collect_properties_from(
     root: &serde_json::Value,
     schema: &serde_json::Value,
@@ -829,10 +830,12 @@ fn collect_properties_from(
         }
     }
 
-    // Recurse into allOf branches.
-    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
-        for branch in all_of {
-            collect_properties_from(root, branch, props, seen, depth + 1);
+    // Recurse into allOf, oneOf, and anyOf branches.
+    for keyword in &["allOf", "oneOf", "anyOf"] {
+        if let Some(branches) = schema.get(*keyword).and_then(|v| v.as_array()) {
+            for branch in branches {
+                collect_properties_from(root, branch, props, seen, depth + 1);
+            }
         }
     }
 }
@@ -851,46 +854,140 @@ fn format_annotation(schema: &serde_json::Value) -> Option<String> {
 
 /// Collect possible value suggestions for a property at the given pointer path.
 ///
-/// Navigates to the subschema at `pointer` + `property_name`, then inspects
-/// `enum`, `const`, and `type` to generate value suggestions.
+/// Resolves to the parent schema at `pointer`, then walks `properties` and
+/// `allOf`/`oneOf`/`anyOf` composition branches to find all definitions of
+/// `property_name` and collect their value suggestions.
 pub fn collect_values(
     root: &serde_json::Value,
     pointer: &[String],
     property_name: &str,
 ) -> Vec<ValueSuggestion> {
-    let mut full_pointer: Vec<String> = pointer.to_vec();
-    full_pointer.push(property_name.to_string());
-
-    let Some(subschema) = resolve_subschema_at_pointer(root, &full_pointer) else {
-        return vec![];
-    };
-
     let mut suggestions = Vec::new();
 
-    // Check for const.
-    if let Some(const_val) = subschema.get("const") {
-        suggestions.push(ValueSuggestion::Const(const_val.clone()));
-        return suggestions;
-    }
-
-    // Check for enum.
-    if let Some(enum_vals) = subschema.get("enum").and_then(|v| v.as_array()) {
-        for val in enum_vals {
-            suggestions.push(ValueSuggestion::Enum(val.clone()));
+    // Resolve to the parent schema (the containing object).
+    let parent = if pointer.is_empty() {
+        let mut visited = HashSet::new();
+        match follow_ref(root, root, &mut visited) {
+            Some(s) => s,
+            None => return suggestions,
         }
-        return suggestions;
+    } else {
+        match resolve_subschema_at_pointer(root, pointer) {
+            Some(s) => s,
+            None => return suggestions,
+        }
+    };
+
+    // Collect values from this parent's definition of the property.
+    collect_values_at_property(root, parent, property_name, &mut suggestions, 0);
+    suggestions
+}
+
+/// Walk a parent schema's `properties` and composition branches to find all
+/// definitions of the target property name, collecting value suggestions from each.
+fn collect_values_at_property(
+    root: &serde_json::Value,
+    parent_schema: &serde_json::Value,
+    property_name: &str,
+    suggestions: &mut Vec<ValueSuggestion>,
+    depth: usize,
+) {
+    if depth > MAX_SCHEMA_DEPTH {
+        return;
     }
 
-    // Check for type-based suggestions.
-    if let Some(type_str) = subschema.get("type").and_then(|v| v.as_str()) {
-        match type_str {
-            "boolean" => suggestions.push(ValueSuggestion::Boolean),
-            "null" => suggestions.push(ValueSuggestion::Null),
+    // Follow $ref on the parent.
+    let mut visited = HashSet::new();
+    let Some(parent_schema) = follow_ref(root, parent_schema, &mut visited) else {
+        return;
+    };
+
+    // Check properties.<property_name> on this schema node.
+    if let Some(prop_schema) = parent_schema
+        .get("properties")
+        .and_then(|p| p.get(property_name))
+    {
+        collect_values_from(root, prop_schema, suggestions, depth + 1);
+    }
+
+    // Walk composition branches at the parent level.
+    for keyword in &["allOf", "oneOf", "anyOf"] {
+        if let Some(branches) = parent_schema.get(*keyword).and_then(|v| v.as_array()) {
+            for branch in branches {
+                collect_values_at_property(root, branch, property_name, suggestions, depth + 1);
+            }
+        }
+    }
+}
+
+/// Extract value suggestions from a single schema node, then recurse into
+/// its `allOf`/`oneOf`/`anyOf` composition branches.
+fn collect_values_from(
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    suggestions: &mut Vec<ValueSuggestion>,
+    depth: usize,
+) {
+    if depth > MAX_SCHEMA_DEPTH {
+        return;
+    }
+
+    // Follow $ref.
+    let mut visited = HashSet::new();
+    let Some(schema) = follow_ref(root, schema, &mut visited) else {
+        return;
+    };
+
+    // Check for const (local early return — only this branch).
+    if let Some(const_val) = schema.get("const") {
+        let suggestion = ValueSuggestion::Const(const_val.clone());
+        if !suggestions.contains(&suggestion) {
+            suggestions.push(suggestion);
+        }
+        return;
+    }
+
+    // Check for enum (local early return — only this branch).
+    if let Some(enum_vals) = schema.get("enum").and_then(|v| v.as_array()) {
+        for val in enum_vals {
+            let suggestion = ValueSuggestion::Enum(val.clone());
+            if !suggestions.contains(&suggestion) {
+                suggestions.push(suggestion);
+            }
+        }
+        return;
+    }
+
+    // Check type — normalize string and array forms into a uniform iterator.
+    let types: Vec<&str> = match schema.get("type") {
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect(),
+        _ => vec![],
+    };
+    for t in &types {
+        match *t {
+            "boolean" => {
+                if !suggestions.contains(&ValueSuggestion::Boolean) {
+                    suggestions.push(ValueSuggestion::Boolean);
+                }
+            }
+            "null" => {
+                if !suggestions.contains(&ValueSuggestion::Null) {
+                    suggestions.push(ValueSuggestion::Null);
+                }
+            }
             _ => {}
         }
     }
 
-    suggestions
+    // Recurse into composition keywords.
+    for keyword in &["allOf", "oneOf", "anyOf"] {
+        if let Some(branches) = schema.get(*keyword).and_then(|v| v.as_array()) {
+            for branch in branches {
+                collect_values_from(root, branch, suggestions, depth + 1);
+            }
+        }
+    }
 }
 
 /// Resolve the subschema at a given JSON pointer path within a schema.
@@ -1397,6 +1494,211 @@ mod tests {
         });
         let values = collect_values(&schema, &[], "name");
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn collect_values_oneof_enums() {
+        let schema = serde_json::json!({
+            "properties": {
+                "mode": {
+                    "oneOf": [
+                        { "enum": ["a", "b"] },
+                        { "enum": ["c", "d"] }
+                    ]
+                }
+            }
+        });
+        let values = collect_values(&schema, &[], "mode");
+        assert_eq!(values.len(), 4);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "a"));
+        assert!(matches!(&values[1], ValueSuggestion::Enum(v) if v == "b"));
+        assert!(matches!(&values[2], ValueSuggestion::Enum(v) if v == "c"));
+        assert!(matches!(&values[3], ValueSuggestion::Enum(v) if v == "d"));
+    }
+
+    #[test]
+    fn collect_values_anyof_mixed() {
+        let schema = serde_json::json!({
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        { "enum": ["x"] },
+                        { "type": "boolean" }
+                    ]
+                }
+            }
+        });
+        let values = collect_values(&schema, &[], "value");
+        assert_eq!(values.len(), 2);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "x"));
+        assert!(matches!(&values[1], ValueSuggestion::Boolean));
+    }
+
+    #[test]
+    fn collect_values_allof_union() {
+        let schema = serde_json::json!({
+            "properties": {
+                "mode": {
+                    "allOf": [
+                        { "enum": ["a", "b"] },
+                        { "enum": ["b", "c"] }
+                    ]
+                }
+            }
+        });
+        let values = collect_values(&schema, &[], "mode");
+        assert_eq!(values.len(), 3, "expected deduped union, got: {values:?}");
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "a"));
+        assert!(matches!(&values[1], ValueSuggestion::Enum(v) if v == "b"));
+        assert!(matches!(&values[2], ValueSuggestion::Enum(v) if v == "c"));
+    }
+
+    #[test]
+    fn collect_values_type_array() {
+        let schema = serde_json::json!({
+            "properties": {
+                "value": { "type": ["boolean", "null"] }
+            }
+        });
+        let values = collect_values(&schema, &[], "value");
+        assert_eq!(values.len(), 2);
+        assert!(matches!(&values[0], ValueSuggestion::Boolean));
+        assert!(matches!(&values[1], ValueSuggestion::Null));
+    }
+
+    #[test]
+    fn collect_values_type_array_string_only() {
+        let schema = serde_json::json!({
+            "properties": {
+                "value": { "type": ["string", "number"] }
+            }
+        });
+        let values = collect_values(&schema, &[], "value");
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn collect_values_nested_composition() {
+        let schema = serde_json::json!({
+            "properties": {
+                "value": {
+                    "oneOf": [
+                        { "allOf": [{ "enum": ["a"] }] },
+                        { "const": "b" }
+                    ]
+                }
+            }
+        });
+        let values = collect_values(&schema, &[], "value");
+        assert_eq!(values.len(), 2);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "a"));
+        assert!(matches!(&values[1], ValueSuggestion::Const(v) if v == "b"));
+    }
+
+    #[test]
+    fn collect_values_ref_in_composition() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Modes": { "enum": ["fast", "slow"] }
+            },
+            "properties": {
+                "mode": {
+                    "oneOf": [
+                        { "$ref": "#/$defs/Modes" },
+                        { "type": "null" }
+                    ]
+                }
+            }
+        });
+        let values = collect_values(&schema, &[], "mode");
+        assert_eq!(values.len(), 3);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "fast"));
+        assert!(matches!(&values[1], ValueSuggestion::Enum(v) if v == "slow"));
+        assert!(matches!(&values[2], ValueSuggestion::Null));
+    }
+
+    #[test]
+    fn collect_values_composition_at_parent() {
+        // Property defined in oneOf branches at the parent level.
+        let schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "properties": {
+                        "status": { "enum": ["active", "inactive"] }
+                    }
+                },
+                {
+                    "properties": {
+                        "status": { "enum": ["pending"] }
+                    }
+                }
+            ]
+        });
+        let values = collect_values(&schema, &[], "status");
+        assert_eq!(values.len(), 3);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "active"));
+        assert!(matches!(&values[1], ValueSuggestion::Enum(v) if v == "inactive"));
+        assert!(matches!(&values[2], ValueSuggestion::Enum(v) if v == "pending"));
+    }
+
+    #[test]
+    fn collect_values_dedup_across_branches() {
+        let schema = serde_json::json!({
+            "properties": {
+                "value": {
+                    "oneOf": [
+                        { "enum": ["same"] },
+                        { "enum": ["same"] }
+                    ]
+                }
+            }
+        });
+        let values = collect_values(&schema, &[], "value");
+        assert_eq!(values.len(), 1, "duplicates should be removed");
+    }
+
+    #[test]
+    fn collect_properties_oneof() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                },
+                {
+                    "properties": {
+                        "age": { "type": "number" }
+                    }
+                }
+            ]
+        });
+        let props = collect_properties(&schema, &[]);
+        assert_eq!(props.len(), 2);
+        assert!(props.iter().any(|p| p.name == "name"));
+        assert!(props.iter().any(|p| p.name == "age"));
+    }
+
+    #[test]
+    fn collect_properties_anyof() {
+        let schema = serde_json::json!({
+            "anyOf": [
+                {
+                    "properties": {
+                        "host": { "type": "string" }
+                    }
+                },
+                {
+                    "properties": {
+                        "port": { "type": "number" }
+                    }
+                }
+            ]
+        });
+        let props = collect_properties(&schema, &[]);
+        assert_eq!(props.len(), 2);
+        assert!(props.iter().any(|p| p.name == "host"));
+        assert!(props.iter().any(|p| p.name == "port"));
     }
 
     #[test]
