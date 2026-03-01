@@ -764,6 +764,31 @@ pub enum ValueSuggestion {
     Null,
 }
 
+impl ValueSuggestion {
+    /// Return a dedup key that uniquely identifies this suggestion.
+    ///
+    /// For string-valued enums/consts (the dominant case) this avoids the
+    /// full JSON-serialization overhead of `serde_json::Value::Display` by
+    /// using the raw `&str` directly.
+    fn dedup_key(&self) -> String {
+        match self {
+            Self::Const(v) | Self::Enum(v) => {
+                let prefix = if matches!(self, Self::Const(_)) {
+                    "c:"
+                } else {
+                    "e:"
+                };
+                match v.as_str() {
+                    Some(s) => format!("{prefix}{s}"),
+                    None => format!("{prefix}{v}"),
+                }
+            }
+            Self::Boolean => "b".into(),
+            Self::Null => "n".into(),
+        }
+    }
+}
+
 /// Collect all completable properties from a schema at the given pointer path.
 ///
 /// Follows `$ref` and merges `allOf`/`oneOf`/`anyOf` branches. Returns an empty
@@ -866,6 +891,7 @@ pub fn collect_values(
     property_name: &str,
 ) -> Vec<ValueSuggestion> {
     let mut suggestions = Vec::new();
+    let mut seen = HashSet::new();
 
     // Resolve to the parent schema (the containing object).
     let Some(parent) = resolve_subschema_at_pointer(root, pointer) else {
@@ -873,7 +899,7 @@ pub fn collect_values(
     };
 
     // Collect values from this parent's definition of the property.
-    collect_values_at_property(root, parent, property_name, &mut suggestions, 0);
+    collect_values_at_property(root, parent, property_name, &mut suggestions, &mut seen, 0);
     suggestions
 }
 
@@ -884,6 +910,7 @@ fn collect_values_at_property(
     parent_schema: &serde_json::Value,
     property_name: &str,
     suggestions: &mut Vec<ValueSuggestion>,
+    seen: &mut HashSet<String>,
     depth: usize,
 ) {
     if depth > MAX_SCHEMA_DEPTH {
@@ -901,14 +928,21 @@ fn collect_values_at_property(
         .get("properties")
         .and_then(|p| p.get(property_name))
     {
-        collect_values_from(root, prop_schema, suggestions, depth + 1);
+        collect_values_from(root, prop_schema, suggestions, seen, depth + 1);
     }
 
     // Walk composition branches at the parent level.
     for keyword in COMPOSITION_KEYWORDS {
         if let Some(branches) = parent_schema.get(*keyword).and_then(|v| v.as_array()) {
             for branch in branches {
-                collect_values_at_property(root, branch, property_name, suggestions, depth + 1);
+                collect_values_at_property(
+                    root,
+                    branch,
+                    property_name,
+                    suggestions,
+                    seen,
+                    depth + 1,
+                );
             }
         }
     }
@@ -920,6 +954,7 @@ fn collect_values_from(
     root: &serde_json::Value,
     schema: &serde_json::Value,
     suggestions: &mut Vec<ValueSuggestion>,
+    seen: &mut HashSet<String>,
     depth: usize,
 ) {
     if depth > MAX_SCHEMA_DEPTH {
@@ -935,7 +970,7 @@ fn collect_values_from(
     // Check for const (local early return — only this branch).
     if let Some(const_val) = schema.get("const") {
         let suggestion = ValueSuggestion::Const(const_val.clone());
-        if !suggestions.contains(&suggestion) {
+        if seen.insert(suggestion.dedup_key()) {
             suggestions.push(suggestion);
         }
         return;
@@ -945,7 +980,7 @@ fn collect_values_from(
     if let Some(enum_vals) = schema.get("enum").and_then(|v| v.as_array()) {
         for val in enum_vals {
             let suggestion = ValueSuggestion::Enum(val.clone());
-            if !suggestions.contains(&suggestion) {
+            if seen.insert(suggestion.dedup_key()) {
                 suggestions.push(suggestion);
             }
         }
@@ -961,12 +996,12 @@ fn collect_values_from(
     for t in &types {
         match *t {
             "boolean" => {
-                if !suggestions.contains(&ValueSuggestion::Boolean) {
+                if seen.insert(ValueSuggestion::Boolean.dedup_key()) {
                     suggestions.push(ValueSuggestion::Boolean);
                 }
             }
             "null" => {
-                if !suggestions.contains(&ValueSuggestion::Null) {
+                if seen.insert(ValueSuggestion::Null.dedup_key()) {
                     suggestions.push(ValueSuggestion::Null);
                 }
             }
@@ -978,7 +1013,7 @@ fn collect_values_from(
     for keyword in COMPOSITION_KEYWORDS {
         if let Some(branches) = schema.get(*keyword).and_then(|v| v.as_array()) {
             for branch in branches {
-                collect_values_from(root, branch, suggestions, depth + 1);
+                collect_values_from(root, branch, suggestions, seen, depth + 1);
             }
         }
     }
