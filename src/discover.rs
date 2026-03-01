@@ -270,7 +270,7 @@ impl CompiledSchemaMappings {
             if entry.globset.is_match(file_relative) {
                 return Some(match &entry.mapping {
                     SchemaMapping::Url(m) => SchemaSource::Url(m.url.clone()),
-                    SchemaMapping::Path(m) => SchemaSource::File(project_root.join(&m.path)),
+                    SchemaMapping::Path(m) => SchemaSource::file(project_root.join(&m.path)),
                 });
             }
         }

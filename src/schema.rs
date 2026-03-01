@@ -83,6 +83,30 @@ impl SchemaError {
     }
 }
 
+/// Normalize a file path for use as a cache key.
+///
+/// Uses `std::fs::canonicalize` when the file exists (resolves symlinks,
+/// case, and `.`/`..` segments). Falls back to lexical normalization
+/// (strip `.` and `..` segments without I/O) for non-existent paths.
+pub(crate) fn normalize_file_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_lexical(path))
+}
+
+/// Strip `.` and `..` segments from an absolute path without touching the filesystem.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
+            c => components.push(c),
+        }
+    }
+    components.iter().collect()
+}
+
 /// Where the schema came from.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum SchemaSource {
@@ -90,6 +114,13 @@ pub enum SchemaSource {
     File(PathBuf),
     /// An HTTP/HTTPS URL.
     Url(String),
+}
+
+impl SchemaSource {
+    /// Create a `File` source with a normalized path.
+    pub fn file(path: PathBuf) -> Self {
+        SchemaSource::File(normalize_file_path(&path))
+    }
 }
 
 impl std::fmt::Display for SchemaSource {
@@ -116,7 +147,7 @@ pub fn resolve_schema_ref(schema_ref: &str, base_dir: &Path) -> SchemaSource {
         } else {
             base_dir.join(path)
         };
-        SchemaSource::File(abs)
+        SchemaSource::file(abs)
     }
 }
 
@@ -459,6 +490,19 @@ struct SlotResult {
 impl SchemaCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Return all `SchemaSource::File` paths currently in the cache.
+    pub fn cached_file_paths(&self) -> Vec<PathBuf> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter_map(|source| match source {
+                SchemaSource::File(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Evict a cached schema slot, forcing recompilation on the next

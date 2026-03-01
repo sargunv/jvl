@@ -166,6 +166,20 @@ impl TestClient {
         .await;
     }
 
+    /// Send `workspace/didChangeWatchedFiles` notification.
+    pub async fn did_change_watched_files(&mut self, changes: &[(&str, u32)]) {
+        let changes: Vec<serde_json::Value> = changes
+            .iter()
+            .map(|(uri, kind)| serde_json::json!({"uri": uri, "type": kind}))
+            .collect();
+        self.send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWatchedFiles",
+            "params": { "changes": changes }
+        }))
+        .await;
+    }
+
     /// Send `shutdown` request.
     pub async fn shutdown(&mut self) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
