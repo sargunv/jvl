@@ -493,7 +493,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // Shed load: only the most recent request matters.
+        // Shed load: drop request if too many are already in flight.
         let Ok(_permit) = self.request_semaphore.try_acquire() else {
             return Ok(None);
         };
@@ -508,7 +508,6 @@ impl LanguageServer for Backend {
         let schema_cache = Arc::clone(&self.schema_cache);
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
         let markdown = self.hover_markdown.load(Ordering::Relaxed);
-        let uri = uri.clone();
 
         // 3. All blocking work (parsing, schema resolution, hover lookup)
         //    in spawn_blocking to avoid blocking the tokio runtime.
@@ -566,7 +565,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        // Shed load: only the most recent request matters.
+        // Shed load: drop request if too many are already in flight.
         let Ok(_permit) = self.request_semaphore.try_acquire() else {
             return Ok(None);
         };
@@ -586,7 +585,6 @@ impl LanguageServer for Backend {
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
         let snippet = self.snippet_support.load(Ordering::Relaxed);
         let markdown = self.hover_markdown.load(Ordering::Relaxed);
-        let uri = uri.clone();
 
         // 3. All blocking work (parsing, schema resolution, completion building)
         //    in spawn_blocking to avoid blocking the tokio runtime.
