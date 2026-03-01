@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "$defs": {
+    "Address": {
+      "title": "Address",
+      "description": "A postal address",
+      "type": "object",
+      "properties": {
+        "street": {
+          "title": "Street",
+          "description": "Street name and number",
+          "type": "string"
+        }
+      }
+    }
+  },
+  "properties": {
+    "name": {
+      "title": "Name",
+      "description": "The user's full name",
+      "type": "string"
+    },
+    "age": { "type": "number" },
+    "address": { "$ref": "#/$defs/Address" },
+    "settings": {
+      "title": "Settings",
+      "description": "Application settings",
+      "type": "object",
+      "properties": {
+        "theme": {
+          "title": "Theme",
+          "description": "UI color theme",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

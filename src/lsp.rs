@@ -13,7 +13,7 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use crate::diagnostic::{FileDiagnostic, Severity};
 use crate::discover::{self, CompiledFileFilter, CompiledSchemaMappings, Config};
 use crate::parse;
-use crate::schema::{SchemaCache, SchemaSource};
+use crate::schema::{self, SchemaCache, SchemaSource};
 use crate::validate;
 
 /// Compiled jvl.json config with resolved schema mappings.
@@ -54,7 +54,8 @@ impl ResolvedDocument {
 pub struct Backend {
     client: Client,
     /// Open documents: URI → (LSP version, full text content)
-    document_map: Arc<Mutex<HashMap<Uri, (i32, String)>>>,
+    #[allow(clippy::type_complexity)]
+    document_map: Arc<Mutex<HashMap<Uri, (i32, Arc<String>)>>>,
     /// jvl.json config cache: config file path → compiled config
     config_cache: Arc<Mutex<HashMap<PathBuf, Arc<CompiledConfig>>>>,
     /// Compiled JSON Schema validator cache (shared with validate_file)
@@ -67,6 +68,8 @@ pub struct Backend {
     watched_schema_paths: Arc<Mutex<HashSet<PathBuf>>>,
     /// Monotonically increasing counter for unique watcher registration IDs.
     next_reg_id: Arc<AtomicU64>,
+    /// True if the client supports Markdown in hover content.
+    hover_markdown: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -86,6 +89,7 @@ impl Backend {
             utf8_positions: Arc::new(AtomicBool::new(false)),
             watched_schema_paths: Arc::new(Mutex::new(HashSet::new())),
             next_reg_id: Arc::new(AtomicU64::new(0)),
+            hover_markdown: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -298,6 +302,15 @@ impl LanguageServer for Backend {
 
         self.utf8_positions.store(utf8, Ordering::Relaxed);
 
+        // Check if client supports Markdown in hover content.
+        if let Some(text_doc) = &params.capabilities.text_document
+            && let Some(hover_caps) = &text_doc.hover
+            && let Some(formats) = &hover_caps.content_format
+        {
+            self.hover_markdown
+                .store(formats.contains(&MarkupKind::Markdown), Ordering::Relaxed);
+        }
+
         let position_encoding = if utf8 {
             PositionEncodingKind::UTF8
         } else {
@@ -314,6 +327,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -371,7 +385,7 @@ impl LanguageServer for Backend {
 
         {
             let mut docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.insert(uri.clone(), (version, content));
+            docs.insert(uri.clone(), (version, Arc::new(content)));
         }
 
         self.spawn_validation(uri);
@@ -388,7 +402,7 @@ impl LanguageServer for Backend {
 
         {
             let mut docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
-            docs.insert(uri.clone(), (version, content));
+            docs.insert(uri.clone(), (version, Arc::new(content)));
         }
 
         self.spawn_validation(uri);
@@ -405,6 +419,94 @@ impl LanguageServer for Backend {
 
         // Clear diagnostics for this document.
         self.client.publish_diagnostics(uri, vec![], None).await;
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        // 1. Snapshot document text from document_map.
+        let content = {
+            let docs = self.document_map.lock().unwrap_or_else(|e| e.into_inner());
+            docs.get(&uri).map(|(_, c)| c.clone())
+        };
+        let Some(content) = content else {
+            return Ok(None);
+        };
+
+        // 2. Parse the document.
+        let parsed = match parse::parse_jsonc(&content) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+
+        // 3. Convert LSP position to byte offset.
+        let utf8 = self.utf8_positions.load(Ordering::Relaxed);
+        let line_starts = parse::compute_line_starts(&content);
+        let line_idx = position.line as usize;
+        let line_start = match line_starts.get(line_idx) {
+            Some(&start) => start,
+            None => return Ok(None),
+        };
+        let line_end = line_starts
+            .get(line_idx + 1)
+            .copied()
+            .unwrap_or(content.len());
+        let line_text = &content[line_start..line_end];
+        let byte_col = lsp_col_to_byte(line_text, position.character, utf8);
+        let byte_offset = line_start + byte_col;
+
+        // 4. Find JSON pointer at byte offset.
+        let Some((pointer, node_range)) = parse::offset_to_pointer(&parsed.ast, byte_offset) else {
+            return Ok(None);
+        };
+
+        // 5. Resolve schema source for this document.
+        let Some(file_path) = uri.to_file_path().map(Cow::into_owned) else {
+            return Ok(None);
+        };
+        let resolved = resolve_schema_for_document(&file_path, &self.config_cache);
+
+        // If no schema source from config, try the $schema field in the document itself.
+        let schema_source = match resolved
+            .schema_source
+            .or_else(|| schema::resolve_schema_from_value(&parsed.value, &file_path))
+        {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // 6. Ensure schema is compiled and get the raw schema value.
+        let schema_value = match self
+            .schema_cache
+            .get_or_compile_with_value(&schema_source, false)
+        {
+            Ok(Some(v)) => v,
+            _ => return Ok(None),
+        };
+
+        // 7. Look up hover content from schema annotations.
+        let Some(hover_content) = schema::lookup_hover_content(&schema_value, &pointer) else {
+            return Ok(None);
+        };
+
+        // 8. Convert node_range back to LSP Range.
+        let start_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.start, utf8);
+        let end_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.end, utf8);
+
+        let kind = if self.hover_markdown.load(Ordering::Relaxed) {
+            MarkupKind::Markdown
+        } else {
+            MarkupKind::PlainText
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind,
+                value: hover_content,
+            }),
+            range: Some(Range::new(start_pos, end_pos)),
+        }))
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -564,6 +666,29 @@ fn resolve_schema_for_document(
     }
 }
 
+/// Convert a byte offset in `source` to an LSP `Position`.
+///
+/// Uses `offset_to_line_col` to find the 1-based line/column, then converts
+/// the byte column to the negotiated LSP encoding (UTF-8 or UTF-16).
+fn byte_offset_to_lsp_position(
+    source: &str,
+    line_starts: &[usize],
+    offset: usize,
+    utf8: bool,
+) -> Position {
+    let (line_1, col_1) = parse::offset_to_line_col(line_starts, offset);
+    let line_idx = line_1.saturating_sub(1);
+    let line_start = line_starts.get(line_idx).copied().unwrap_or(source.len());
+    let line_end = line_starts
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(source.len());
+    let line_text = &source[line_start..line_end];
+    let byte_col = col_1.saturating_sub(1);
+    let lsp_char = byte_col_to_lsp(line_text, byte_col, utf8);
+    Position::new(line_idx as u32, lsp_char)
+}
+
 /// Convert a byte column offset to an LSP character offset using the negotiated encoding.
 fn byte_col_to_lsp(line: &str, byte_col: usize, utf8: bool) -> u32 {
     let safe_col = byte_col.min(line.len());
@@ -571,6 +696,26 @@ fn byte_col_to_lsp(line: &str, byte_col: usize, utf8: bool) -> u32 {
         safe_col as u32
     } else {
         line[..safe_col].encode_utf16().count() as u32
+    }
+}
+
+/// Convert an LSP character offset back to a byte column offset.
+///
+/// This is the inverse of `byte_col_to_lsp`. When `utf8` is true, the character
+/// offset equals the byte offset. For UTF-16, we scan from the start of the line
+/// counting UTF-16 code units until we reach `lsp_char`.
+fn lsp_col_to_byte(line: &str, lsp_char: u32, utf8: bool) -> usize {
+    if utf8 {
+        (lsp_char as usize).min(line.len())
+    } else {
+        let mut utf16_count: u32 = 0;
+        for (byte_idx, ch) in line.char_indices() {
+            if utf16_count >= lsp_char {
+                return byte_idx;
+            }
+            utf16_count += ch.len_utf16() as u32;
+        }
+        line.len()
     }
 }
 
@@ -602,23 +747,7 @@ fn file_diagnostic_to_lsp(
 
             // End position is derived from the span's byte offset + length.
             let end_offset = loc.offset + loc.length;
-            let (end_line_1based, end_col_1based) =
-                parse::offset_to_line_col(line_starts, end_offset);
-            let end_line_idx = end_line_1based.saturating_sub(1);
-            let end_line_start = line_starts
-                .get(end_line_idx)
-                .copied()
-                .unwrap_or(source.len());
-            let end_line_end = line_starts
-                .get(end_line_idx + 1)
-                .copied()
-                .unwrap_or(source.len());
-            let end_line_text = source[end_line_start..end_line_end]
-                .trim_end_matches('\n')
-                .trim_end_matches('\r');
-            let end_byte_col = end_col_1based.saturating_sub(1);
-            let end_char = byte_col_to_lsp(end_line_text, end_byte_col, utf8);
-            let end_pos = Position::new(end_line_idx as u32, end_char);
+            let end_pos = byte_offset_to_lsp_position(source, line_starts, end_offset, utf8);
 
             (start_pos, end_pos)
         }

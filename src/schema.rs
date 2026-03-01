@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +8,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::diagnostic::Warning;
+use crate::parse;
 
 /// Custom retriever that routes `$ref` fetches through jvl's disk cache.
 struct CachingRetriever {
@@ -149,6 +150,21 @@ pub fn resolve_schema_ref(schema_ref: &str, base_dir: &Path) -> SchemaSource {
         };
         SchemaSource::file(abs)
     }
+}
+
+/// Try to resolve a schema source from the `$schema` field in a parsed JSON value.
+///
+/// Returns `None` if the value has no `$schema` string field. Relative paths
+/// in the `$schema` value are resolved against the parent directory of
+/// `file_path`.
+pub fn resolve_schema_from_value(
+    parsed_value: &serde_json::Value,
+    file_path: &Path,
+) -> Option<SchemaSource> {
+    parse::extract_schema_field(parsed_value).map(|schema_ref| {
+        let base_dir = file_path.parent().unwrap_or(Path::new("."));
+        resolve_schema_ref(schema_ref, base_dir)
+    })
 }
 
 /// Cache directory for fetched schemas.
@@ -483,6 +499,7 @@ struct SchemaSlot {
 
 struct SlotResult {
     validator: Result<Arc<jsonschema::Validator>, SchemaError>,
+    schema_value: Option<Arc<serde_json::Value>>,
     warnings: Vec<Warning>,
     cache_outcome: Option<CacheOutcome>,
 }
@@ -515,6 +532,30 @@ impl SchemaCache {
             .unwrap_or_else(|e| e.into_inner())
             .remove(source)
             .is_some()
+    }
+
+    /// Retrieve the raw schema JSON for a previously compiled source.
+    ///
+    /// Returns `None` if the source has not been compiled yet or if compilation
+    /// failed before the schema could be parsed.
+    pub fn get_schema_value(&self, source: &SchemaSource) -> Option<Arc<serde_json::Value>> {
+        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = slots.get(source)?;
+        let result = slot.compiled.get()?;
+        result.schema_value.clone()
+    }
+
+    /// Get or compile the schema and return the raw schema JSON value.
+    ///
+    /// Combines [`get_or_compile`](Self::get_or_compile) and
+    /// [`get_schema_value`](Self::get_schema_value) in a single operation.
+    pub fn get_or_compile_with_value(
+        &self,
+        source: &SchemaSource,
+        no_cache: bool,
+    ) -> Result<Option<Arc<serde_json::Value>>, SchemaError> {
+        let _ = self.get_or_compile(source, no_cache)?;
+        Ok(self.get_schema_value(source))
     }
 
     /// Get or load+compile a schema validator.
@@ -550,6 +591,7 @@ impl SchemaCache {
                 Err(e) => {
                     return SlotResult {
                         validator: Err(e),
+                        schema_value: None,
                         warnings: vec![],
                         cache_outcome: None,
                     };
@@ -564,11 +606,14 @@ impl SchemaCache {
                             path: source.to_string(),
                             reason: e.to_string(),
                         }),
+                        schema_value: None,
                         warnings,
                         cache_outcome,
                     };
                 }
             };
+
+            let schema_value = Arc::new(schema_value);
 
             let validator = match jsonschema::options()
                 .with_retriever(CachingRetriever { no_cache })
@@ -578,6 +623,7 @@ impl SchemaCache {
                 Err(e) => {
                     return SlotResult {
                         validator: Err(SchemaError::CompileError(e.to_string())),
+                        schema_value: Some(Arc::clone(&schema_value)),
                         warnings,
                         cache_outcome,
                     };
@@ -586,6 +632,7 @@ impl SchemaCache {
 
             SlotResult {
                 validator: Ok(Arc::new(validator)),
+                schema_value: Some(schema_value),
                 warnings,
                 cache_outcome,
             }
@@ -608,6 +655,155 @@ impl SchemaCache {
             Err(e) => Err(e.clone()),
         }
     }
+}
+
+/// Schema annotations (title/description) for a JSON path.
+pub struct SchemaAnnotation {
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+impl SchemaAnnotation {
+    /// Format as Markdown for LSP hover display.
+    ///
+    /// Returns `None` if both `title` and `description` are `None`.
+    pub fn to_markdown(&self) -> Option<String> {
+        const MAX_LEN: usize = 10_000;
+        let truncate = |s: &str| -> String {
+            if s.len() > MAX_LEN {
+                let end = s.floor_char_boundary(MAX_LEN);
+                format!("{}...", &s[..end])
+            } else {
+                s.to_string()
+            }
+        };
+
+        match (self.title.as_deref(), self.description.as_deref()) {
+            (Some(t), Some(d)) => Some(format!("**{}**\n\n{}", truncate(t), truncate(d))),
+            (Some(t), None) => Some(format!("**{}**", truncate(t))),
+            (None, Some(d)) => Some(truncate(d)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Walk a raw schema `serde_json::Value` following a JSON pointer path and
+/// return structured schema annotations (title/description).
+///
+/// Handles `properties`, `items`/`prefixItems`, and fragment-only `$ref`.
+/// Returns `None` if no `title` or `description` annotation is found.
+pub fn lookup_schema_annotation(
+    schema: &serde_json::Value,
+    pointer: &[String],
+) -> Option<SchemaAnnotation> {
+    let mut visited_refs: HashSet<String> = HashSet::new();
+    let subschema = resolve_subschema(schema, schema, pointer, &mut visited_refs)?;
+
+    let title = subschema
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let description = subschema
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if title.is_none() && description.is_none() {
+        return None;
+    }
+
+    Some(SchemaAnnotation { title, description })
+}
+
+/// Walk a raw schema `serde_json::Value` following a JSON pointer path and
+/// return formatted hover content (title/description as Markdown).
+///
+/// Handles `properties`, `items`/`prefixItems`, and fragment-only `$ref`.
+/// Returns `None` if no `title` or `description` annotation is found.
+pub fn lookup_hover_content(schema: &serde_json::Value, pointer: &[String]) -> Option<String> {
+    lookup_schema_annotation(schema, pointer)?.to_markdown()
+}
+
+/// Resolve the subschema at a given JSON pointer path within a schema.
+fn resolve_subschema<'a>(
+    root: &'a serde_json::Value,
+    schema: &'a serde_json::Value,
+    pointer: &[String],
+    visited: &mut HashSet<String>,
+) -> Option<&'a serde_json::Value> {
+    // Follow $ref before descending.
+    let schema = follow_ref(root, schema, visited)?;
+
+    if pointer.is_empty() {
+        return Some(schema);
+    }
+
+    let segment = &pointer[0];
+    let rest = &pointer[1..];
+
+    // Try properties.<segment>
+    if let Some(prop_schema) = schema
+        .get("properties")
+        .and_then(|p| p.get(segment.as_str()))
+    {
+        return resolve_subschema(root, prop_schema, rest, visited);
+    }
+
+    // Try items (for array elements with numeric index).
+    if let Ok(idx) = segment.parse::<usize>() {
+        if let Some(items) = schema.get("items")
+            && (items.is_object() || items.is_boolean())
+        {
+            return resolve_subschema(root, items, rest, visited);
+        }
+        // Try prefixItems[i]
+        if let Some(prefix_items) = schema.get("prefixItems").and_then(|p| p.as_array())
+            && let Some(item_schema) = prefix_items.get(idx)
+        {
+            return resolve_subschema(root, item_schema, rest, visited);
+        }
+    }
+
+    None
+}
+
+/// Follow `$ref` within the same document. Only fragment references (`#/...`)
+/// are followed. Returns the resolved schema, or the input schema if no `$ref`.
+fn follow_ref<'a>(
+    root: &'a serde_json::Value,
+    schema: &'a serde_json::Value,
+    visited: &mut HashSet<String>,
+) -> Option<&'a serde_json::Value> {
+    let ref_str = match schema.get("$ref").and_then(|v| v.as_str()) {
+        Some(r) => r,
+        None => return Some(schema),
+    };
+
+    // Only follow fragment references within the same document.
+    if !ref_str.starts_with('#') {
+        return Some(schema);
+    }
+
+    // Cycle detection.
+    if !visited.insert(ref_str.to_string()) {
+        return None;
+    }
+
+    // Parse the JSON Pointer from the fragment (strip leading `#/`).
+    let pointer_str = ref_str.strip_prefix("#/").unwrap_or("");
+    if pointer_str.is_empty() {
+        return Some(root);
+    }
+
+    let mut target = root;
+    for segment in pointer_str.split('/') {
+        // Unescape JSON Pointer encoding (~1 = /, ~0 = ~).
+        let unescaped = segment.replace("~1", "/").replace("~0", "~");
+        target = target.get(&unescaped)?;
+    }
+
+    // Recursively follow if the target itself has a $ref.
+    follow_ref(root, target, visited)
 }
 
 #[cfg(test)]
@@ -669,5 +865,168 @@ mod tests {
         let cache = SchemaCache::new();
         let source = SchemaSource::File(PathBuf::from("/nonexistent/schema.json"));
         assert!(!cache.evict(&source));
+    }
+
+    #[test]
+    fn hover_simple_property() {
+        let schema = serde_json::json!({
+            "properties": {
+                "name": {
+                    "title": "Name",
+                    "description": "The user's name"
+                }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["name".into()]);
+        assert_eq!(result, Some("**Name**\n\nThe user's name".into()));
+    }
+
+    #[test]
+    fn hover_nested_property() {
+        let schema = serde_json::json!({
+            "properties": {
+                "server": {
+                    "properties": {
+                        "host": {
+                            "title": "Host",
+                            "description": "Server hostname"
+                        }
+                    }
+                }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["server".into(), "host".into()]);
+        assert_eq!(result, Some("**Host**\n\nServer hostname".into()));
+    }
+
+    #[test]
+    fn hover_ref_resolution() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Address": {
+                    "title": "Address",
+                    "description": "A postal address"
+                }
+            },
+            "properties": {
+                "home": { "$ref": "#/$defs/Address" }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["home".into()]);
+        assert_eq!(result, Some("**Address**\n\nA postal address".into()));
+    }
+
+    #[test]
+    fn hover_ref_cycle_returns_none() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "A": { "$ref": "#/$defs/B" },
+                "B": { "$ref": "#/$defs/A" }
+            },
+            "properties": {
+                "x": { "$ref": "#/$defs/A" }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["x".into()]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn hover_external_ref_ignored() {
+        let schema = serde_json::json!({
+            "properties": {
+                "x": {
+                    "$ref": "https://evil.example.com/schema",
+                    "title": "Fallback"
+                }
+            }
+        });
+        // External $ref is ignored; sibling title is shown.
+        let result = lookup_hover_content(&schema, &["x".into()]);
+        assert_eq!(result, Some("**Fallback**".into()));
+    }
+
+    #[test]
+    fn hover_no_annotation_returns_none() {
+        let schema = serde_json::json!({
+            "properties": {
+                "count": { "type": "number" }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["count".into()]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn hover_title_only() {
+        let schema = serde_json::json!({
+            "properties": {
+                "x": { "title": "Just a title" }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["x".into()]);
+        assert_eq!(result, Some("**Just a title**".into()));
+    }
+
+    #[test]
+    fn hover_description_only() {
+        let schema = serde_json::json!({
+            "properties": {
+                "x": { "description": "Just a description" }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["x".into()]);
+        assert_eq!(result, Some("Just a description".into()));
+    }
+
+    #[test]
+    fn hover_items_array() {
+        let schema = serde_json::json!({
+            "properties": {
+                "tags": {
+                    "items": {
+                        "title": "Tag",
+                        "description": "A tag string"
+                    }
+                }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["tags".into(), "0".into()]);
+        assert_eq!(result, Some("**Tag**\n\nA tag string".into()));
+    }
+
+    #[test]
+    fn hover_prefix_items() {
+        let schema = serde_json::json!({
+            "properties": {
+                "coords": {
+                    "prefixItems": [
+                        { "title": "X", "description": "X coordinate" },
+                        { "title": "Y", "description": "Y coordinate" }
+                    ]
+                }
+            }
+        });
+        let result = lookup_hover_content(&schema, &["coords".into(), "1".into()]);
+        assert_eq!(result, Some("**Y**\n\nY coordinate".into()));
+    }
+
+    #[test]
+    fn hover_truncate_multibyte_boundary() {
+        // Place a 4-byte emoji (U+1F600) right at the 10,000-byte boundary.
+        let prefix = "x".repeat(9_999);
+        let long_desc = format!("{prefix}\u{1F600}extra");
+
+        let schema = serde_json::json!({
+            "properties": {
+                "x": { "description": long_desc }
+            }
+        });
+
+        // Must not panic, and must produce valid truncated output.
+        let result = lookup_hover_content(&schema, &["x".into()]).unwrap();
+        assert!(result.ends_with("..."));
+        // The emoji straddles byte 10,000, so it should be excluded.
+        assert!(!result.contains('\u{1F600}'));
     }
 }
