@@ -70,6 +70,19 @@ pub enum SchemaError {
     CompileError(String),
 }
 
+impl SchemaError {
+    /// The underlying reason without the schema path/URL prefix.
+    /// Use this when the schema location is already shown in a source span.
+    pub fn reason(&self) -> &str {
+        match self {
+            SchemaError::FileRead { reason, .. }
+            | SchemaError::ParseError { reason, .. }
+            | SchemaError::FetchError { reason, .. } => reason,
+            SchemaError::CompileError(msg) => msg,
+        }
+    }
+}
+
 /// Where the schema came from.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum SchemaSource {

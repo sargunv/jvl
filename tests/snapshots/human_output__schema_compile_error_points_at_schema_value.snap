@@ -1,0 +1,14 @@
+---
+source: tests/human_output.rs
+expression: stderr
+---
+  × schema(compile): Pointer '/$defs/missing' does not exist
+   ╭─[[fixtures]/schema-compile-error.json:1:14]
+ 1 │ { "$schema": "./bad-schema.json", "name": "test" }
+   ·              ─────────┬─────────
+   ·                       ╰── schema referenced here
+   ╰────
+
+
+✗ Found 1 error in 1 file
+  Checked 1 file ([duration])

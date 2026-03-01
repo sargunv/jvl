@@ -382,28 +382,19 @@ fn contains() {
 fn schema_load_error_points_at_schema_value() {
     let (stderr, code) = jvl_human(&["check", &fixture("schema-load-error.json")]);
     assert_eq!(code, 2);
-    // The underline should point at the $schema value, not at (0,0).
-    assert!(
-        stderr.contains("schema referenced here"),
-        "expected 'schema referenced here' label in stderr: {stderr}"
-    );
-    // The source header should point at the $schema value (col 14), not (1,1).
-    assert!(
-        stderr.contains(":1:14]"),
-        "expected source location :1:14 in stderr: {stderr}"
-    );
+    with_human_settings(|| insta::assert_snapshot!(stderr));
 }
 
 #[test]
 fn schema_compile_error_points_at_schema_value() {
     let (stderr, code) = jvl_human(&["check", &fixture("schema-compile-error.json")]);
     assert_eq!(code, 2);
-    assert!(
-        stderr.contains("schema referenced here"),
-        "expected 'schema referenced here' label in stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains(":1:14]"),
-        "expected source location :1:14 in stderr: {stderr}"
-    );
+    with_human_settings(|| insta::assert_snapshot!(stderr));
+}
+
+#[test]
+fn schema_network_error_points_at_schema_value() {
+    let (stderr, code) = jvl_human(&["check", &fixture("schema-network-error.json")]);
+    assert_eq!(code, 2);
+    with_human_settings(|| insta::assert_snapshot!(stderr));
 }

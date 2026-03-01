@@ -137,16 +137,24 @@ pub fn validate_file(
                         length: r.len(),
                     }
                 });
+                let label = span.as_ref().map(|_| "schema referenced here".into());
+                // When the span points at the $schema value, the path is
+                // already visible in the source snippet — just show the reason.
+                let message = if span.is_some() {
+                    e.reason().to_string()
+                } else {
+                    e.to_string()
+                };
                 return (
                     FileResult::tool_error(
                         file_path,
                         vec![FileDiagnostic {
                             code: format!("schema({category})"),
-                            message: e.to_string(),
+                            message,
                             severity: Severity::Error,
                             span,
                             location,
-                            label: Some("schema referenced here".into()),
+                            label,
                             help: None,
                             schema_path: None,
                         }],

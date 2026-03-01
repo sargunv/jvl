@@ -1,1 +1,1 @@
-{ "$schema": "./bad-ref-schema.json", "name": "test" }
+{ "$schema": "./bad-schema.json", "name": "test" }
