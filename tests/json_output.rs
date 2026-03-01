@@ -340,6 +340,156 @@ fn tool_error() {
 }
 
 #[test]
+fn schema_load_error_with_schema_field() {
+    let (json, code) = jvl_json(&[
+        "check",
+        "--format",
+        "json",
+        &fixture("schema-load-error.json"),
+    ]);
+
+    assert_eq!(code, 2);
+    insta::assert_json_snapshot!(json, {
+        ".files[].path" => "[path]",
+        ".summary.duration_ms" => "[duration]",
+    }, @r#"
+    {
+      "files": [
+        {
+          "errors": [
+            {
+              "code": "schema(load)",
+              "location": {
+                "column": 14,
+                "length": 27,
+                "line": 1,
+                "offset": 13
+              },
+              "message": "No such file or directory (os error 2)",
+              "severity": "error"
+            }
+          ],
+          "path": "[path]",
+          "valid": false
+        }
+      ],
+      "summary": {
+        "checked_files": 1,
+        "duration_ms": "[duration]",
+        "errors": 1,
+        "invalid_files": 1,
+        "skipped_files": 0,
+        "valid_files": 0,
+        "warnings": 0
+      },
+      "valid": false,
+      "version": 1,
+      "warnings": []
+    }
+    "#);
+}
+
+#[test]
+fn schema_compile_error_with_schema_field() {
+    let (json, code) = jvl_json(&[
+        "check",
+        "--format",
+        "json",
+        &fixture("schema-compile-error.json"),
+    ]);
+
+    assert_eq!(code, 2);
+    insta::assert_json_snapshot!(json, {
+        ".files[].path" => "[path]",
+        ".summary.duration_ms" => "[duration]",
+    }, @r#"
+    {
+      "files": [
+        {
+          "errors": [
+            {
+              "code": "schema(compile)",
+              "location": {
+                "column": 14,
+                "length": 19,
+                "line": 1,
+                "offset": 13
+              },
+              "message": "Pointer '/$defs/missing' does not exist",
+              "severity": "error"
+            }
+          ],
+          "path": "[path]",
+          "valid": false
+        }
+      ],
+      "summary": {
+        "checked_files": 1,
+        "duration_ms": "[duration]",
+        "errors": 1,
+        "invalid_files": 1,
+        "skipped_files": 0,
+        "valid_files": 0,
+        "warnings": 0
+      },
+      "valid": false,
+      "version": 1,
+      "warnings": []
+    }
+    "#);
+}
+
+#[test]
+fn schema_network_error_with_schema_field() {
+    let (json, code) = jvl_json(&[
+        "check",
+        "--format",
+        "json",
+        &fixture("schema-network-error.json"),
+    ]);
+
+    assert_eq!(code, 2);
+    insta::assert_json_snapshot!(json, {
+        ".files[].path" => "[path]",
+        ".summary.duration_ms" => "[duration]",
+    }, @r#"
+    {
+      "files": [
+        {
+          "errors": [
+            {
+              "code": "schema(compile)",
+              "location": {
+                "column": 14,
+                "length": 23,
+                "line": 1,
+                "offset": 13
+              },
+              "message": "Resource 'http://0.0.0.0:1/nonexistent' is not present in a registry and retrieving it failed: Failed to fetch schema from 'http://0.0.0.0:1/nonexistent': error sending request for url (http://0.0.0.0:1/nonexistent)",
+              "severity": "error"
+            }
+          ],
+          "path": "[path]",
+          "valid": false
+        }
+      ],
+      "summary": {
+        "checked_files": 1,
+        "duration_ms": "[duration]",
+        "errors": 1,
+        "invalid_files": 1,
+        "skipped_files": 0,
+        "valid_files": 0,
+        "warnings": 0
+      },
+      "valid": false,
+      "version": 1,
+      "warnings": []
+    }
+    "#);
+}
+
+#[test]
 fn deeply_nested_error() {
     let (json, code) = jvl_json(&[
         "check",
