@@ -74,8 +74,10 @@ pub struct Backend {
     config_cache: Arc<Mutex<HashMap<PathBuf, Arc<CompiledConfig>>>>,
     /// Compiled JSON Schema validator cache (shared with validate_file)
     schema_cache: Arc<SchemaCache>,
-    /// Caps concurrent spawn_blocking validations to prevent thread pool pressure
+    /// Caps concurrent spawn_blocking validations to prevent thread pool pressure.
     validation_semaphore: Arc<Semaphore>,
+    /// Caps concurrent spawn_blocking requests (hover + completion) to prevent thread pool pressure.
+    request_semaphore: Arc<Semaphore>,
     /// True if the client negotiated UTF-8 position encoding; false = UTF-16 (default).
     utf8_positions: Arc<AtomicBool>,
     /// Schema file paths for which we have registered file watchers.
@@ -102,6 +104,7 @@ impl Backend {
             config_cache: Arc::new(Mutex::new(HashMap::new())),
             schema_cache: Arc::new(SchemaCache::new()),
             validation_semaphore: Arc::new(Semaphore::new(8)),
+            request_semaphore: Arc::new(Semaphore::new(4)),
             utf8_positions: Arc::new(AtomicBool::new(false)),
             watched_schema_paths: Arc::new(Mutex::new(HashSet::new())),
             next_reg_id: Arc::new(AtomicU64::new(0)),
@@ -269,30 +272,6 @@ impl Backend {
     fn snapshot_document(&self, uri: &Uri) -> Option<Arc<String>> {
         let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         docs.get(uri).map(|state| state.content.clone())
-    }
-
-    /// Resolve the schema source for a document URI, compile it, and return
-    /// the raw schema `serde_json::Value`. Returns `None` if the URI is not a
-    /// file:// URI, no schema is configured, or the schema fails to compile.
-    fn resolve_schema_value(
-        &self,
-        uri: &Uri,
-        parsed_value: &serde_json::Value,
-    ) -> Option<Arc<serde_json::Value>> {
-        let file_path = uri.to_file_path().map(Cow::into_owned)?;
-        let resolved = resolve_schema_for_document(&file_path, &self.config_cache);
-
-        let schema_source = resolved
-            .schema_source
-            .or_else(|| schema::resolve_schema_from_value(parsed_value, &file_path))?;
-
-        match self
-            .schema_cache
-            .get_or_compile_with_value(&schema_source, false)
-        {
-            Ok(Some(v)) => Some(v),
-            _ => None,
-        }
     }
 
     /// Register file watchers for newly discovered schema file paths.
@@ -514,73 +493,92 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // 1. Snapshot document text.
+        // Shed load: only the most recent request matters.
+        let Ok(_permit) = self.request_semaphore.try_acquire() else {
+            return Ok(None);
+        };
+
+        // 1. Snapshot document text (quick lock, stays on async thread).
         let Some(content) = self.snapshot_document(&uri) else {
             return Ok(None);
         };
 
-        // 2. Parse the document.
-        let parsed = match parse::parse_jsonc(&content) {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
-        };
-
-        // 3. Convert LSP position to byte offset.
+        // 2. Clone shared state needed inside spawn_blocking.
+        let config_cache = Arc::clone(&self.config_cache);
+        let schema_cache = Arc::clone(&self.schema_cache);
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
-        let line_starts = parse::compute_line_starts(&content);
-        let Some(byte_offset) = lsp_position_to_byte_offset(&content, &line_starts, position, utf8)
-        else {
-            return Ok(None);
-        };
+        let markdown = self.hover_markdown.load(Ordering::Relaxed);
+        let uri = uri.clone();
 
-        // 4. Find JSON pointer at byte offset.
-        let Some((pointer, node_range)) = parse::offset_to_pointer(&parsed.ast, byte_offset) else {
-            return Ok(None);
-        };
+        // 3. All blocking work (parsing, schema resolution, hover lookup)
+        //    in spawn_blocking to avoid blocking the tokio runtime.
+        let result = tokio::task::spawn_blocking(move || {
+            // 3a. Parse the document.
+            let parsed = parse::parse_jsonc(&content).ok()?;
 
-        // 5. Resolve schema value for this document.
-        let Some(schema_value) = self.resolve_schema_value(&uri, &parsed.value) else {
-            return Ok(None);
-        };
+            // 3b. Convert LSP position to byte offset.
+            let line_starts = parse::compute_line_starts(&content);
+            let byte_offset = lsp_position_to_byte_offset(&content, &line_starts, position, utf8)?;
 
-        // 6. Look up hover content from schema annotations.
-        let Some(hover_content) = schema::lookup_hover_content(&schema_value, &pointer) else {
-            return Ok(None);
-        };
+            // 3c. Find JSON pointer at byte offset.
+            let (pointer, node_range) = parse::offset_to_pointer(&parsed.ast, byte_offset)?;
 
-        // 7. Convert node_range back to LSP Range.
-        let start_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.start, utf8);
-        let end_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.end, utf8);
+            // 3d. Resolve schema value for this document.
+            let schema_value =
+                resolve_schema_value(&uri, &parsed.value, &config_cache, &schema_cache)?;
 
-        let kind = if self.hover_markdown.load(Ordering::Relaxed) {
-            MarkupKind::Markdown
-        } else {
-            MarkupKind::PlainText
-        };
+            // 3e. Look up hover content from schema annotations.
+            let hover_content = schema::lookup_hover_content(&schema_value, &pointer)?;
 
-        Ok(Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind,
-                value: hover_content,
-            }),
-            range: Some(Range::new(start_pos, end_pos)),
-        }))
+            // 3f. Convert node_range back to LSP Range.
+            let start_pos =
+                byte_offset_to_lsp_position(&content, &line_starts, node_range.start, utf8);
+            let end_pos = byte_offset_to_lsp_position(&content, &line_starts, node_range.end, utf8);
+
+            let kind = if markdown {
+                MarkupKind::Markdown
+            } else {
+                MarkupKind::PlainText
+            };
+
+            Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind,
+                    value: hover_content,
+                }),
+                range: Some(Range::new(start_pos, end_pos)),
+            })
+        })
+        .await;
+
+        match result {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("jvl: hover task panicked: {e}"))
+                    .await;
+                Ok(None)
+            }
+        }
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        // 1. Snapshot document text + parse cache (quick lock, stays on async thread).
-        let Some(content) = self.snapshot_document(&uri) else {
+        // Shed load: only the most recent request matters.
+        let Ok(_permit) = self.request_semaphore.try_acquire() else {
             return Ok(None);
         };
-        let cached = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&uri)
-            .and_then(|state| state.last_good_parse.clone());
+
+        // 1. Snapshot document text + parse cache (single lock, stays on async thread).
+        let (content, cached) = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(state) = docs.get(&uri) else {
+                return Ok(None);
+            };
+            (state.content.clone(), state.last_good_parse.clone())
+        };
 
         // 2. Clone shared state needed inside spawn_blocking.
         let config_cache = Arc::clone(&self.config_cache);
@@ -588,7 +586,7 @@ impl LanguageServer for Backend {
         let utf8 = self.utf8_positions.load(Ordering::Relaxed);
         let snippet = self.snippet_support.load(Ordering::Relaxed);
         let markdown = self.hover_markdown.load(Ordering::Relaxed);
-        let uri_clone = uri.clone();
+        let uri = uri.clone();
 
         // 3. All blocking work (parsing, schema resolution, completion building)
         //    in spawn_blocking to avoid blocking the tokio runtime.
@@ -616,15 +614,8 @@ impl LanguageServer for Backend {
             let ctx = parse::completion_context(&content, byte_offset)?;
 
             // 3d. Resolve schema value for this document.
-            let file_path = uri_clone.to_file_path().map(Cow::into_owned)?;
-            let resolved = resolve_schema_for_document(&file_path, &config_cache);
-            let schema_source = resolved
-                .schema_source
-                .or_else(|| schema::resolve_schema_from_value(&parsed_value, &file_path))?;
-            let schema_value = match schema_cache.get_or_compile_with_value(&schema_source, false) {
-                Ok(Some(v)) => v,
-                _ => return None,
-            };
+            let schema_value =
+                resolve_schema_value(&uri, &parsed_value, &config_cache, &schema_cache)?;
 
             // 3e. Compute the replacement range for text_edit.
             let replace_start = match &ctx {
@@ -729,6 +720,28 @@ impl LanguageServer for Backend {
                 self.spawn_validation(uri);
             }
         }
+    }
+}
+
+/// Resolve the schema source for a document URI, compile it, and return
+/// the raw schema `serde_json::Value`. Returns `None` if the URI is not a
+/// file:// URI, no schema is configured, or the schema fails to compile.
+fn resolve_schema_value(
+    uri: &Uri,
+    parsed_value: &serde_json::Value,
+    config_cache: &Mutex<HashMap<PathBuf, Arc<CompiledConfig>>>,
+    schema_cache: &SchemaCache,
+) -> Option<Arc<serde_json::Value>> {
+    let file_path = uri.to_file_path().map(Cow::into_owned)?;
+    let resolved = resolve_schema_for_document(&file_path, config_cache);
+
+    let schema_source = resolved
+        .schema_source
+        .or_else(|| schema::resolve_schema_from_value(parsed_value, &file_path))?;
+
+    match schema_cache.get_or_compile_with_value(&schema_source, false) {
+        Ok(Some(v)) => Some(v),
+        _ => None,
     }
 }
 
