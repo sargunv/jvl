@@ -903,6 +903,56 @@ pub fn collect_values(
     suggestions
 }
 
+/// Collect possible value suggestions for items in an array at the given pointer path.
+///
+/// Resolves to the array schema at `pointer`, then walks the `items` subschema
+/// and `allOf`/`oneOf`/`anyOf` composition branches to collect value suggestions.
+pub fn collect_array_item_values(
+    root: &serde_json::Value,
+    pointer: &[String],
+) -> Vec<ValueSuggestion> {
+    let mut suggestions = Vec::new();
+    let mut seen = HashSet::new();
+
+    let Some(array_schema) = resolve_subschema_at_pointer(root, pointer) else {
+        return suggestions;
+    };
+
+    collect_array_items_from(root, array_schema, &mut suggestions, &mut seen, 0);
+    suggestions
+}
+
+/// Extract value suggestions from an array schema's `items`, then recurse into
+/// composition branches on the array schema itself.
+fn collect_array_items_from(
+    root: &serde_json::Value,
+    array_schema: &serde_json::Value,
+    suggestions: &mut Vec<ValueSuggestion>,
+    seen: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SCHEMA_DEPTH {
+        return;
+    }
+
+    let mut visited = HashSet::new();
+    let Some(schema) = follow_ref(root, array_schema, &mut visited) else {
+        return;
+    };
+
+    if let Some(items) = schema.get("items") {
+        collect_values_from(root, items, suggestions, seen, depth + 1);
+    }
+
+    for keyword in COMPOSITION_KEYWORDS {
+        if let Some(branches) = schema.get(*keyword).and_then(|v| v.as_array()) {
+            for branch in branches {
+                collect_array_items_from(root, branch, suggestions, seen, depth + 1);
+            }
+        }
+    }
+}
+
 /// Walk a parent schema's `properties` and composition branches to find all
 /// definitions of the target property name, collecting value suggestions from each.
 fn collect_values_at_property(
@@ -1684,6 +1734,152 @@ mod tests {
         });
         let values = collect_values(&schema, &[], "value");
         assert_eq!(values.len(), 1, "duplicates should be removed");
+    }
+
+    #[test]
+    fn collect_array_items_enum() {
+        let schema = serde_json::json!({
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": { "enum": ["frontend", "backend", "devops"] }
+                }
+            }
+        });
+        let values = collect_array_item_values(&schema, &["tags".to_string()]);
+        assert_eq!(values.len(), 3);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "frontend"));
+        assert!(matches!(&values[1], ValueSuggestion::Enum(v) if v == "backend"));
+        assert!(matches!(&values[2], ValueSuggestion::Enum(v) if v == "devops"));
+    }
+
+    #[test]
+    fn collect_array_items_const() {
+        let schema = serde_json::json!({
+            "properties": {
+                "values": {
+                    "type": "array",
+                    "items": { "const": 42 }
+                }
+            }
+        });
+        let values = collect_array_item_values(&schema, &["values".to_string()]);
+        assert_eq!(values.len(), 1);
+        assert!(matches!(&values[0], ValueSuggestion::Const(v) if v == &serde_json::json!(42)));
+    }
+
+    #[test]
+    fn collect_array_items_boolean() {
+        let schema = serde_json::json!({
+            "properties": {
+                "flags": {
+                    "type": "array",
+                    "items": { "type": "boolean" }
+                }
+            }
+        });
+        let values = collect_array_item_values(&schema, &["flags".to_string()]);
+        assert_eq!(values.len(), 1);
+        assert!(matches!(&values[0], ValueSuggestion::Boolean));
+    }
+
+    #[test]
+    fn collect_array_items_no_items_schema() {
+        let schema = serde_json::json!({
+            "properties": {
+                "data": { "type": "array" }
+            }
+        });
+        let values = collect_array_item_values(&schema, &["data".to_string()]);
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn collect_array_items_oneof() {
+        let schema = serde_json::json!({
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            { "enum": ["a", "b"] },
+                            { "const": "c" }
+                        ]
+                    }
+                }
+            }
+        });
+        let values = collect_array_item_values(&schema, &["tags".to_string()]);
+        assert_eq!(values.len(), 3);
+    }
+
+    #[test]
+    fn collect_array_items_composition_on_array() {
+        let schema = serde_json::json!({
+            "properties": {
+                "tags": {
+                    "allOf": [
+                        { "items": { "enum": ["a"] } },
+                        { "items": { "enum": ["b"] } }
+                    ]
+                }
+            }
+        });
+        let values = collect_array_item_values(&schema, &["tags".to_string()]);
+        assert_eq!(values.len(), 2);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "a"));
+        assert!(matches!(&values[1], ValueSuggestion::Enum(v) if v == "b"));
+    }
+
+    #[test]
+    fn collect_array_items_nested_array() {
+        let schema = serde_json::json!({
+            "properties": {
+                "matrix": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": { "enum": ["x", "y"] }
+                    }
+                }
+            }
+        });
+        // pointer ["matrix", "0"] resolves through properties.matrix -> items
+        let values = collect_array_item_values(&schema, &["matrix".to_string(), "0".to_string()]);
+        assert_eq!(values.len(), 2);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "x"));
+        assert!(matches!(&values[1], ValueSuggestion::Enum(v) if v == "y"));
+    }
+
+    #[test]
+    fn collect_array_items_root_array() {
+        let schema = serde_json::json!({
+            "type": "array",
+            "items": { "enum": ["a", "b"] }
+        });
+        let values = collect_array_item_values(&schema, &[]);
+        assert_eq!(values.len(), 2);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "a"));
+        assert!(matches!(&values[1], ValueSuggestion::Enum(v) if v == "b"));
+    }
+
+    #[test]
+    fn collect_array_items_ref() {
+        let schema = serde_json::json!({
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/tag" }
+                }
+            },
+            "$defs": {
+                "tag": { "enum": ["alpha", "beta"] }
+            }
+        });
+        let values = collect_array_item_values(&schema, &["tags".to_string()]);
+        assert_eq!(values.len(), 2);
+        assert!(matches!(&values[0], ValueSuggestion::Enum(v) if v == "alpha"));
+        assert!(matches!(&values[1], ValueSuggestion::Enum(v) if v == "beta"));
     }
 
     #[test]

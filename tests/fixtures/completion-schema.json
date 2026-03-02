@@ -40,7 +40,11 @@
     "multi_enum": {
       "anyOf": [{ "enum": ["fast", "slow"] }, { "enum": ["medium"] }]
     },
-    "typed_nullable": { "type": ["string", "null"] }
+    "typed_nullable": { "type": ["string", "null"] },
+    "tags": {
+      "type": "array",
+      "items": { "enum": ["frontend", "backend", "devops"] }
+    }
   },
   "required": ["name"]
 }

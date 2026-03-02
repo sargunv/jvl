@@ -618,7 +618,8 @@ impl LanguageServer for Backend {
             // 3e. Compute the replacement range for text_edit.
             let replace_start = match &ctx {
                 parse::CompletionContext::PropertyKey { replace_start, .. }
-                | parse::CompletionContext::PropertyValue { replace_start, .. } => *replace_start,
+                | parse::CompletionContext::PropertyValue { replace_start, .. }
+                | parse::CompletionContext::ArrayItem { replace_start, .. } => *replace_start,
             };
             let replace_end = if content.as_bytes().get(byte_offset) == Some(&b'"') {
                 byte_offset + 1
@@ -643,6 +644,10 @@ impl LanguageServer for Backend {
                     ..
                 } => {
                     let values = schema::collect_values(&schema_value, pointer, property_name);
+                    build_value_items(&values, replace_range)
+                }
+                parse::CompletionContext::ArrayItem { pointer, .. } => {
+                    let values = schema::collect_array_item_values(&schema_value, pointer);
                     build_value_items(&values, replace_range)
                 }
             };
