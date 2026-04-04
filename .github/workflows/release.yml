@@ -60,7 +60,7 @@ jobs:
           tar czf ../../../jvl-${{ matrix.target }}.tar.gz jvl
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jvl-${{ matrix.target }}
           path: jvl-${{ matrix.target }}.tar.gz
@@ -82,7 +82,7 @@ jobs:
           git push origin "v${{ needs.version.outputs.version }}"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
