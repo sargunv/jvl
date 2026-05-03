@@ -36,6 +36,10 @@ jobs:
             runner: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -57,15 +61,20 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package artifact
+        shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../jvl-${{ matrix.target }}.tar.gz jvl
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a ../../../jvl-${{ matrix.target }}.zip jvl.exe
+          else
+            tar czf ../../../jvl-${{ matrix.target }}.tar.gz jvl
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: jvl-${{ matrix.target }}
-          path: jvl-${{ matrix.target }}.tar.gz
+          path: jvl-${{ matrix.target }}.*
           if-no-files-found: error
 
   release:

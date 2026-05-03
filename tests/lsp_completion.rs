@@ -22,11 +22,11 @@ fn doc_uri() -> String {
 
 /// Build a JSON document with an absolute $schema pointing to completion-schema.json.
 fn doc_with_schema(content: &str) -> String {
-    let schema = completion_schema_path();
+    let schema = serde_json::to_string(&completion_schema_path()).unwrap();
     if content.is_empty() {
-        format!(r#"{{"$schema": "{schema}"}}"#)
+        format!(r#"{{"$schema": {schema}}}"#)
     } else {
-        format!(r#"{{"$schema": "{schema}", {content}}}"#)
+        format!(r#"{{"$schema": {schema}, {content}}}"#)
     }
 }
 
@@ -299,8 +299,8 @@ async fn completion_malformed_document_uses_stale_cache() {
     // Now send a malformed edit (simulating typing a new property key).
     // No closing } — truly malformed so parse_jsonc fails.
     let malformed = format!(
-        r#"{{"$schema": "{}", "name": "Alice", "#,
-        completion_schema_path()
+        r#"{{"$schema": {}, "name": "Alice", "#,
+        serde_json::to_string(&completion_schema_path()).unwrap()
     );
     client.did_change(&uri, 2, &malformed).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -340,7 +340,10 @@ async fn completion_text_edit_covers_auto_paired_quotes() {
     // Simulate the auto-paired quote scenario: user types " after comma,
     // editor produces "" with cursor between. The document becomes malformed:
     // {"$schema": "...", ""}
-    let malformed = format!(r#"{{"$schema": "{}", ""}}"#, completion_schema_path());
+    let malformed = format!(
+        r#"{{"$schema": {}, ""}}"#,
+        serde_json::to_string(&completion_schema_path()).unwrap()
+    );
     client.did_change(&uri, 2, &malformed).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     client

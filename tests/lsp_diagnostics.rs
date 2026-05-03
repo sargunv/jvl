@@ -24,8 +24,8 @@ fn doc_uri() -> String {
 /// Build a JSON document content string that uses an absolute $schema path.
 fn doc_with_schema(content: &str) -> String {
     // Use absolute path to avoid any path resolution issues.
-    let schema = simple_schema_path();
-    format!(r#"{{"$schema": "{schema}", {content}}}"#)
+    let schema = serde_json::to_string(&simple_schema_path()).unwrap();
+    format!(r#"{{"$schema": {schema}, {content}}}"#)
 }
 
 /// Open a file with a $schema field → server should publish diagnostics.
@@ -143,9 +143,9 @@ async fn parse_error_produces_diagnostic() {
     client.initialize().await;
 
     let uri = doc_uri();
-    let schema = simple_schema_path();
+    let schema = serde_json::to_string(&simple_schema_path()).unwrap();
     // Deliberately broken JSON: missing closing brace.
-    let content = format!(r#"{{"$schema": "{schema}", "name": "app""#);
+    let content = format!(r#"{{"$schema": {schema}, "name": "app""#);
     client.did_open(&uri, "json", 1, &content).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -204,8 +204,8 @@ async fn strict_mode_with_schema_no_extra_diagnostic() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("jvl.json"), r#"{"strict": true}"#).unwrap();
 
-    let schema_path = simple_schema_path();
-    let content = format!(r#"{{"$schema": "{schema_path}", "name": "app", "port": 8080}}"#);
+    let schema_path = serde_json::to_string(&simple_schema_path()).unwrap();
+    let content = format!(r#"{{"$schema": {schema_path}, "name": "app", "port": 8080}}"#);
 
     let file_path = dir.path().join("test.json");
     std::fs::write(&file_path, &content).unwrap();

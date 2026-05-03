@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -233,11 +234,30 @@ fn load_schema_content(
         SchemaSource::File(path) => {
             let content = fs::read_to_string(path).map_err(|e| SchemaError::FileRead {
                 path: path.display().to_string(),
-                reason: e.to_string(),
+                reason: io_error_reason(&e),
             })?;
             Ok((content, vec![], None))
         }
         SchemaSource::Url(url) => load_url_schema(url, no_cache),
+    }
+}
+
+fn io_error_reason(error: &io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::NotFound => "No such file or directory (os error 2)".to_string(),
+        _ => error.to_string(),
+    }
+}
+
+fn comparable_file_path(path: &Path) -> String {
+    let path = normalize_lexical(path).display().to_string();
+    #[cfg(windows)]
+    {
+        path.trim_start_matches(r"\\?\").to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path
     }
 }
 
@@ -527,10 +547,24 @@ impl SchemaCache {
     ///
     /// Returns `true` if the source was present in the cache.
     pub fn evict(&self, source: &SchemaSource) -> bool {
-        self.slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(source)
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if slots.remove(source).is_some() {
+            return true;
+        }
+
+        let SchemaSource::File(target) = source else {
+            return false;
+        };
+        let target_key = comparable_file_path(target);
+        let matching_source = slots.keys().find_map(|cached| match cached {
+            SchemaSource::File(path) if comparable_file_path(path) == target_key => {
+                Some(cached.clone())
+            }
+            _ => None,
+        });
+
+        matching_source
+            .and_then(|source| slots.remove(&source))
             .is_some()
     }
 
