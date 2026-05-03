@@ -295,7 +295,7 @@ fn strict_no_schema() {
 
 #[test]
 fn tool_error() {
-    let (json, code) = jvl_json(&[
+    let (mut json, code) = jvl_json(&[
         "check",
         "--format",
         "json",
@@ -305,6 +305,7 @@ fn tool_error() {
     ]);
 
     assert_eq!(code, 2);
+    json["files"][0]["errors"][0]["message"] = serde_json::Value::String("[message]".into());
     insta::assert_json_snapshot!(json, {
         ".files[].path" => "[path]",
         ".summary.duration_ms" => "[duration]",
@@ -315,7 +316,7 @@ fn tool_error() {
           "errors": [
             {
               "code": "schema(load)",
-              "message": "Failed to read schema file '/nonexistent/schema.json': No such file or directory (os error 2)",
+              "message": "[message]",
               "severity": "error"
             }
           ],

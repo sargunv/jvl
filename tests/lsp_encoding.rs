@@ -25,7 +25,7 @@ async fn utf8_encoding_column_positions() {
         }))
         .await;
 
-    let schema = simple_schema_path();
+    let schema = serde_json::to_string(&simple_schema_path()).unwrap();
     let uri = file_uri(&format!(
         "{}/tests/fixtures/test-encoding-utf8.json",
         env!("CARGO_MANIFEST_DIR")
@@ -35,7 +35,7 @@ async fn utf8_encoding_column_positions() {
     // {"$schema": "...", "name": "André", "port": "bad"}
     // All ASCII up through port value, but name has non-ASCII chars.
     let schema_val = schema.clone();
-    let content = format!(r#"{{"$schema": "{schema_val}", "name": "André", "port": "bad"}}"#);
+    let content = format!(r#"{{"$schema": {schema_val}, "name": "André", "port": "bad"}}"#);
     client.did_open(&uri, "json", 1, &content).await;
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -66,13 +66,13 @@ async fn utf16_encoding_ascii_content() {
     let mut client = TestClient::new();
     client.initialize().await; // default = UTF-16
 
-    let schema = simple_schema_path();
+    let schema = serde_json::to_string(&simple_schema_path()).unwrap();
     let uri = file_uri(&format!(
         "{}/tests/fixtures/test-encoding-utf16.json",
         env!("CARGO_MANIFEST_DIR")
     ));
     // All-ASCII content, so UTF-8 and UTF-16 positions agree.
-    let content = format!(r#"{{"$schema": "{schema}", "name": "app", "port": "bad"}}"#);
+    let content = format!(r#"{{"$schema": {schema}, "name": "app", "port": "bad"}}"#);
     client.did_open(&uri, "json", 1, &content).await;
 
     tokio::time::sleep(Duration::from_millis(300)).await;

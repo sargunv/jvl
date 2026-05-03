@@ -22,8 +22,8 @@ fn doc_uri() -> String {
 
 /// Build a JSON document with an absolute $schema pointing to hover-schema.json.
 fn doc_with_hover_schema(content: &str) -> String {
-    let schema = hover_schema_path();
-    format!(r#"{{"$schema": "{schema}", {content}}}"#)
+    let schema = serde_json::to_string(&hover_schema_path()).unwrap();
+    format!(r#"{{"$schema": {schema}, {content}}}"#)
 }
 
 /// Open a document and wait for validation to complete (past the debounce window).

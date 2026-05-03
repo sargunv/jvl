@@ -826,7 +826,7 @@ fn resolve_schema_for_document(
     let stripped = canonical_path.as_ref().ok().and_then(|abs| {
         abs.strip_prefix(&compiled.project_root)
             .ok()
-            .map(|r| r.to_string_lossy().to_string())
+            .map(Path::to_path_buf)
     });
     let fallback_warning = if stripped.is_none() {
         Some(format!(
@@ -838,7 +838,7 @@ fn resolve_schema_for_document(
     } else {
         None
     };
-    let relative = stripped.unwrap_or_else(|| path.to_string_lossy().to_string());
+    let relative = stripped.unwrap_or_else(|| path.to_path_buf());
 
     // Only validate files that match the config's files patterns.
     if !compiled.file_filter.matches(&relative) {

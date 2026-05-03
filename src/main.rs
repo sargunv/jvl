@@ -587,12 +587,8 @@ fn run_check(args: CheckArgs) -> ExitCode {
             } else {
                 let relative = std::fs::canonicalize(Path::new(path))
                     .ok()
-                    .and_then(|abs| {
-                        abs.strip_prefix(&project_root)
-                            .ok()
-                            .map(|p| p.to_string_lossy().to_string())
-                    })
-                    .unwrap_or_else(|| path.clone());
+                    .and_then(|abs| abs.strip_prefix(&project_root).ok().map(Path::to_path_buf))
+                    .unwrap_or_else(|| PathBuf::from(path));
 
                 match compiled_mappings.resolve(&relative, &project_root) {
                     Some(s) => (Some(s), "config"),

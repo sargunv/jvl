@@ -29,10 +29,10 @@ async fn rapid_edits_produce_single_diagnostic_notification() {
     client.initialize().await;
 
     let uri = doc_uri();
-    let schema = simple_schema_path();
+    let schema = serde_json::to_string(&simple_schema_path()).unwrap();
 
     // Open with the first version.
-    let content_v1 = format!(r#"{{"$schema": "{schema}", "name": "app", "port": 8080}}"#);
+    let content_v1 = format!(r#"{{"$schema": {schema}, "name": "app", "port": 8080}}"#);
     client.did_open(&uri, "json", 1, &content_v1).await;
 
     // Allow the server coroutines a chance to run (yield to the executor).
@@ -42,7 +42,7 @@ async fn rapid_edits_produce_single_diagnostic_notification() {
     // Send 9 more rapid edits (versions 2-10), alternating valid/invalid content.
     for v in 2..=10i32 {
         let port = if v % 2 == 0 { r#""bad-port""# } else { "8080" };
-        let content = format!(r#"{{"$schema": "{schema}", "name": "v{v}", "port": {port}}}"#);
+        let content = format!(r#"{{"$schema": {schema}, "name": "v{v}", "port": {port}}}"#);
         client.did_change(&uri, v, &content).await;
         tokio::task::yield_now().await;
     }
@@ -84,8 +84,8 @@ async fn did_close_during_debounce_discards_result() {
     client.initialize().await;
 
     let uri = doc_uri();
-    let schema = simple_schema_path();
-    let content = format!(r#"{{"$schema": "{schema}", "name": "app", "port": 8080}}"#);
+    let schema = serde_json::to_string(&simple_schema_path()).unwrap();
+    let content = format!(r#"{{"$schema": {schema}, "name": "app", "port": 8080}}"#);
 
     client.did_open(&uri, "json", 1, &content).await;
     tokio::task::yield_now().await;

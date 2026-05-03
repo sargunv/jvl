@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tower_lsp_server::{LspService, Server};
@@ -20,6 +22,8 @@ pub struct TestClient {
 }
 
 impl TestClient {
+    const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub fn new() -> Self {
         // Two duplex pairs: (client→server) and (server→client).
         let (client_write, server_read) = tokio::io::duplex(65536);
@@ -51,6 +55,12 @@ impl TestClient {
 
     /// Receive the next LSP-framed JSON-RPC message.
     pub async fn recv(&mut self) -> serde_json::Value {
+        tokio::time::timeout(Self::RECV_TIMEOUT, self.recv_inner())
+            .await
+            .expect("timed out waiting for LSP message")
+    }
+
+    async fn recv_inner(&mut self) -> serde_json::Value {
         let mut content_length: usize = 0;
         loop {
             let mut line = String::new();
@@ -248,5 +258,26 @@ impl TestClient {
 /// Convenience: build a `file://` URI from an absolute path string.
 #[allow(dead_code)]
 pub fn file_uri(path: &str) -> String {
-    format!("file://{path}")
+    let path = Path::new(path);
+    let mut uri = String::from("file://");
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                uri.push('/');
+                uri.push_str(&prefix.as_os_str().to_string_lossy());
+            }
+            Component::RootDir => uri.push('/'),
+            Component::CurDir => {}
+            Component::ParentDir => uri.push_str("/.."),
+            Component::Normal(segment) => {
+                if !uri.ends_with('/') {
+                    uri.push('/');
+                }
+                uri.push_str(&segment.to_string_lossy());
+            }
+        }
+    }
+
+    uri
 }

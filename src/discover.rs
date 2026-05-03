@@ -227,15 +227,14 @@ pub fn discover_files(
             }
 
             let path = entry.path();
-            let relative = match path.strip_prefix(project_root) {
+            let absolute_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let relative = match absolute_path.strip_prefix(project_root) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
 
-            let rel_str = relative.to_string_lossy();
-
-            if file_filter.matches(rel_str.as_ref()) {
-                files.push(path.to_path_buf());
+            if file_filter.matches(relative) {
+                files.push(absolute_path);
             }
         }
     }
@@ -271,7 +270,7 @@ impl CompiledSchemaMappings {
     }
 
     /// Resolve a schema for a file based on pre-compiled mappings.
-    pub fn resolve(&self, file_relative: &str, project_root: &Path) -> Option<SchemaSource> {
+    pub fn resolve(&self, file_relative: &Path, project_root: &Path) -> Option<SchemaSource> {
         for entry in &self.entries {
             if entry.globset.is_match(file_relative) {
                 return Some(match &entry.mapping {
@@ -328,7 +327,7 @@ fn build_ordered_patterns(patterns: &[String]) -> Result<Vec<PatternEntry>, Conf
 
 /// Check if a path matches the ordered pattern list.
 /// Later patterns override earlier ones (include/exclude evaluated in sequence).
-fn matches_ordered_patterns(path: &str, patterns: &[PatternEntry]) -> bool {
+fn matches_ordered_patterns(path: &Path, patterns: &[PatternEntry]) -> bool {
     let mut matched = false;
     for entry in patterns {
         if entry.glob.is_match(path) {
@@ -354,7 +353,7 @@ impl CompiledFileFilter {
     }
 
     /// Returns true if the relative path matches the file patterns.
-    pub fn matches(&self, relative_path: &str) -> bool {
+    pub fn matches(&self, relative_path: &Path) -> bool {
         matches_ordered_patterns(relative_path, &self.patterns)
     }
 }

@@ -23,11 +23,11 @@ async fn schema_file_change_triggers_revalidation() {
     )
     .unwrap();
 
-    let schema_abs = std::fs::canonicalize(&schema_path).unwrap();
-    let schema_uri = file_uri(&schema_abs.display().to_string());
+    let schema_uri = file_uri(&schema_path.display().to_string());
 
     // Document: name is a number → invalid against v1 schema.
-    let doc_content = format!(r#"{{"$schema": "{}", "name": 123}}"#, schema_abs.display());
+    let schema_json = serde_json::to_string(&schema_path.display().to_string()).unwrap();
+    let doc_content = format!(r#"{{"$schema": {schema_json}, "name": 123}}"#);
     let doc_uri = file_uri(&doc_path.display().to_string());
 
     let mut client = TestClient::new();
@@ -86,11 +86,11 @@ async fn schema_file_deleted_triggers_load_error() {
     // Schema: accepts anything (empty schema = allow all).
     std::fs::write(&schema_path, r#"{"type":"object"}"#).unwrap();
 
-    let schema_abs = std::fs::canonicalize(&schema_path).unwrap();
-    let schema_uri = file_uri(&schema_abs.display().to_string());
+    let schema_uri = file_uri(&schema_path.display().to_string());
 
     // Document referencing the schema.
-    let doc_content = format!(r#"{{"$schema": "{}"}}"#, schema_abs.display());
+    let schema_json = serde_json::to_string(&schema_path.display().to_string()).unwrap();
+    let doc_content = format!(r#"{{"$schema": {schema_json}}}"#);
     let doc_uri = file_uri(&doc_path.display().to_string());
 
     let mut client = TestClient::new();
