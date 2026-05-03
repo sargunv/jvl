@@ -702,7 +702,7 @@ impl LanguageServer for Backend {
         }
 
         // Evict schema cache for changed files.
-        let mut schema_changed = false;
+        let mut schema_changed = !changed.is_empty();
         for path in &changed {
             if self.schema_cache.evict(&SchemaSource::file(path.clone())) {
                 schema_changed = true;
